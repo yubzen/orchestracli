@@ -1,0 +1,7 @@
+{
+    "allowed": [
+        "read_file",
+        "write_file",
+        "run_command"
+    ]
+}

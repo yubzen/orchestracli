@@ -1,0 +1,65 @@
+package tui
+
+import (
+	"fmt"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+
+	"github.com/yubzen/orchestra/internal/config"
+	"github.com/yubzen/orchestra/internal/state"
+)
+
+var (
+	sbBaseStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("255")).Background(lipgloss.Color("235")).Padding(0, 1)
+	sbRoleStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true)
+	sbModelStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
+	sbCtxGreenStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	sbCtxYellowStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
+	sbCtxRedStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+)
+
+type StatusBarModel struct {
+	Role       string
+	ModelName  string
+	CtxPercent int
+	width      int
+}
+
+func NewStatusBarModel() *StatusBarModel {
+	return &StatusBarModel{
+		Role:       "CODER",
+		ModelName:  "no-model-selected",
+		CtxPercent: 0,
+	}
+}
+
+func NewStatusBarModelWithConfig(_ *config.Config, _ *state.Session) *StatusBarModel {
+	return NewStatusBarModel()
+}
+
+func (m *StatusBarModel) Init() tea.Cmd { return nil }
+
+func (m *StatusBarModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	return m, nil
+}
+
+func (m *StatusBarModel) SetWidth(w int) {
+	m.width = w
+}
+
+func (m *StatusBarModel) View() string {
+	roleStr := sbRoleStyle.Render(fmt.Sprintf("[ROLE: %s]", m.Role))
+	modelStr := sbModelStyle.Render(fmt.Sprintf("[MODEL: %s]", m.ModelName))
+
+	ctxStyle := sbCtxGreenStyle
+	if m.CtxPercent >= 80 {
+		ctxStyle = sbCtxRedStyle
+	} else if m.CtxPercent >= 60 {
+		ctxStyle = sbCtxYellowStyle
+	}
+	ctxStr := ctxStyle.Render(fmt.Sprintf("[CTX: %d%%]", m.CtxPercent))
+
+	s := fmt.Sprintf("%s | %s | %s", roleStr, modelStr, ctxStr)
+	return sbBaseStyle.Width(m.width).Render(s)
+}

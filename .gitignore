@@ -1,0 +1,55 @@
+# --- Binary & Executable Files ---
+/orchestra
+orchestra
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# --- Go Specifics ---
+vendor/
+.cache/
+
+# --- Orchestra Specifics (State & Swarm) ---
+# We ignore ALL local databases to prevent binary merge conflicts and state leaks.
+*.db
+*.db-journal
+*.sqlite
+*.sqlite-metadata
+# Specifically ensuring these local-only files never hit GitHub
+orchestra.db
+orchestra_vec.db
+
+# --- AI & Agent Context (CRITICAL) ---
+# We KEEP AGENTS.md (Shared instructions)
+# We IGNORE .agent/ (Local IDE/Agent scratchpad/indices)
+.agent/
+.rag/
+.cursorignore
+.cursorindexingignore
+
+# Local Persona/Role Overrides
+# Keep the templates in roles/, but ignore your personal test tweaks
+roles/*/local_config.yaml
+
+# --- Security & Credentials ---
+.env
+.env.local
+.env.*.local
+*.pem
+configs/auth.yaml
+
+# --- OS & IDE ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- Testing & Coverage ---
+*.out
+*.test
+coverage.txt
+main

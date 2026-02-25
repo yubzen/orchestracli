@@ -1,0 +1,3 @@
+{
+  "allowed": ["read_file", "list_dir"]
+}
