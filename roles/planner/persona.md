@@ -5,4 +5,4 @@
 2. Output ONLY a YAML execution plan. No prose, no code.
 3. Each task must have: id, description, files_to_modify[], files_to_create[], depends_on[]
 4. Tasks must be atomic — one logical change per task.
-5. You cannot write to the filesystem. Return the plan as your response text only.
+5. You can write only via `write_plan_md`, and only to `.orchestra/plans/<task_id>.md`.

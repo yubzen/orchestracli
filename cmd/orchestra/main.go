@@ -58,7 +58,42 @@ func restoreTerminalState() {
 	fmt.Fprint(os.Stderr, "\x1b[?25h\x1b[0m")
 }
 
-func bootstrapRuntime(cfg *config.Config, mode string) (*runtimeDeps, error) {
+func renderExitLogo() string {
+	const (
+		dimColor    = "\x1b[90m"
+		brightColor = "\x1b[97m"
+		resetColor  = "\x1b[0m"
+	)
+	letters := []rune("ORCHESTRA")
+	var b strings.Builder
+	for i, ch := range letters {
+		color := dimColor
+		if i >= len(letters)-4 {
+			color = brightColor
+		}
+		b.WriteString(color)
+		b.WriteRune(ch)
+		b.WriteString(resetColor)
+		if i < len(letters)-1 {
+			b.WriteRune(' ')
+		}
+	}
+	return b.String()
+}
+
+func printExitSummary(sessionID string) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return
+	}
+	fmt.Println()
+	fmt.Println(renderExitLogo())
+	fmt.Println()
+	fmt.Printf("Session   %s\n", sessionID)
+	fmt.Printf("Continue  orchestra -s %s\n", sessionID)
+}
+
+func bootstrapRuntime(cfg *config.Config, mode, resumeSessionID string) (*runtimeDeps, error) {
 	if cfg == nil {
 		return nil, errors.New("config is nil")
 	}
@@ -66,9 +101,6 @@ func bootstrapRuntime(cfg *config.Config, mode string) (*runtimeDeps, error) {
 	workingDir := strings.TrimSpace(cfg.Defaults.WorkingDir)
 	if workingDir == "" {
 		workingDir = "."
-	}
-	if _, err := os.Stat(workingDir); err != nil {
-		return nil, fmt.Errorf("invalid working directory %q: %w", workingDir, err)
 	}
 
 	rt := &runtimeDeps{}
@@ -81,10 +113,30 @@ func bootstrapRuntime(cfg *config.Config, mode string) (*runtimeDeps, error) {
 	}
 	rt.db = db
 
-	session, err := db.CreateSession(rt.ctx, workingDir, mode)
-	if err != nil {
+	resumeSessionID = strings.TrimSpace(resumeSessionID)
+	var session *state.Session
+	if resumeSessionID != "" {
+		session, err = db.GetSession(rt.ctx, resumeSessionID)
+		if err != nil {
+			rt.Close()
+			return nil, err
+		}
+		if strings.TrimSpace(session.Mode) != "" {
+			mode = session.Mode
+		}
+		if wd := strings.TrimSpace(session.WorkingDir); wd != "" {
+			workingDir = wd
+		}
+	} else {
+		session, err = db.CreateSession(rt.ctx, workingDir, mode)
+		if err != nil {
+			rt.Close()
+			return nil, err
+		}
+	}
+	if _, err := os.Stat(workingDir); err != nil {
 		rt.Close()
-		return nil, err
+		return nil, fmt.Errorf("invalid working directory %q: %w", workingDir, err)
 	}
 	rt.session = session
 
@@ -117,6 +169,11 @@ func bootstrapRuntime(cfg *config.Config, mode string) (*runtimeDeps, error) {
 		}
 	}
 
+	projectBrief, err := rag.BuildProjectBrief(workingDir)
+	if err != nil {
+		projectBrief = fmt.Sprintf("Working directory: %s", workingDir)
+	}
+
 	provider := providers.NewAnthropic()
 
 	planner := agent.NewAgent(agent.RolePlanner, cfg.Providers.Anthropic.DefaultModel, provider, rt.ragStore, rt.indexer)
@@ -130,12 +187,16 @@ func bootstrapRuntime(cfg *config.Config, mode string) (*runtimeDeps, error) {
 	}
 
 	rt.orchestrator = &agent.Orchestrator{
-		Planner:    planner,
-		Coder:      coder,
-		Reviewer:   reviewer,
-		DB:         db,
-		Session:    session,
-		UpdateChan: make(chan agent.StepUpdate, 100),
+		Planner:          planner,
+		Coder:            coder,
+		Reviewer:         reviewer,
+		DB:               db,
+		Session:          session,
+		UpdateChan:       make(chan agent.StepUpdate, 100),
+		EventChan:        make(chan agent.AgentEvent, 200),
+		PlanApprovalChan: make(chan agent.PlanApproval, 4),
+		WorkingDir:       workingDir,
+		ProjectBrief:     projectBrief,
 	}
 
 	return rt, nil
@@ -143,6 +204,7 @@ func bootstrapRuntime(cfg *config.Config, mode string) (*runtimeDeps, error) {
 
 func main() {
 	var orchestrate bool
+	var resumeSessionID string
 
 	rootCmd := &cobra.Command{
 		Use:   "orchestra",
@@ -158,7 +220,7 @@ func main() {
 				mode = "orchestrated"
 			}
 
-			rt, err := bootstrapRuntime(cfg, mode)
+			rt, err := bootstrapRuntime(cfg, mode, resumeSessionID)
 			if err != nil {
 				return err
 			}
@@ -167,11 +229,16 @@ func main() {
 			app := tui.NewAppModel(cfg, rt.db, rt.session, rt.orchestrator)
 			p := tea.NewProgram(app, tea.WithAltScreen(), tea.WithContext(rt.ctx))
 			_, err = p.Run()
-			return err
+			if err != nil {
+				return err
+			}
+			printExitSummary(rt.session.ID)
+			return nil
 		},
 	}
 
 	rootCmd.Flags().BoolVar(&orchestrate, "orchestrate", false, "Launch TUI in Orchestrated mode")
+	rootCmd.Flags().StringVarP(&resumeSessionID, "session", "s", "", "Resume an existing session ID")
 
 	configCmd := &cobra.Command{
 		Use:   "config",
@@ -198,7 +265,7 @@ func main() {
 				return err
 			}
 
-			rt, err := bootstrapRuntime(cfg, "orchestrated")
+			rt, err := bootstrapRuntime(cfg, "orchestrated", headlessSession)
 			if err != nil {
 				return err
 			}

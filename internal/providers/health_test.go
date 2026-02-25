@@ -15,8 +15,8 @@ type MockProvider struct {
 func (m MockProvider) Name() string                                     { return m.name }
 func (m MockProvider) Ping(ctx context.Context) error                   { return m.errOut }
 func (m MockProvider) ListModels(ctx context.Context) ([]string, error) { return nil, nil }
-func (m MockProvider) Complete(ctx context.Context, model string, messages []Message, tools []Tool) (string, error) {
-	return "", nil
+func (m MockProvider) Complete(ctx context.Context, model string, messages []Message, tools []Tool, onToken TokenCallback) (CompletionResponse, error) {
+	return CompletionResponse{}, nil
 }
 
 // TestHealthCheck verifies the CheckAll pings providers

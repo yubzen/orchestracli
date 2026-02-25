@@ -57,6 +57,14 @@ CREATE TABLE IF NOT EXISTS task_results (
 	status TEXT,
 	created_at DATETIME
 );
+CREATE TABLE IF NOT EXISTS session_model_selections (
+	session_id TEXT NOT NULL,
+	role TEXT NOT NULL,
+	provider_key TEXT NOT NULL,
+	model_id TEXT NOT NULL,
+	updated_at DATETIME,
+	PRIMARY KEY (session_id, role)
+);
 `
 
 type providerSpec struct {
@@ -832,7 +840,7 @@ func NewSessionCmd() *cobra.Command {
 
 	resumeCmd := &cobra.Command{
 		Use:   "resume <session-id>",
-		Short: "Resolve and prepare a previous session for resume",
+		Short: "Show session details and a resume command",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			conn, err := openStateDB(dbPath)
@@ -857,7 +865,7 @@ func NewSessionCmd() *cobra.Command {
 			fmt.Printf("Created at: %s\n", asString(createdAt))
 			fmt.Printf("Working dir: %s\n", workingDir)
 			fmt.Printf("Mode: %s\n", mode)
-			fmt.Println("Resume handoff is scaffolded; attach runtime wiring is next.")
+			fmt.Printf("Continue with: orchestra -s %s\n", id)
 			return nil
 		},
 	}

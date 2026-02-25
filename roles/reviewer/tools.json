@@ -1,5 +1,5 @@
 {
-    "allowed": [
-        "read_file"
-    ]
+  "allowed": [
+    "read_file"
+  ]
 }

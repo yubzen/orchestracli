@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -20,22 +21,29 @@ var (
 )
 
 type StatusBarModel struct {
-	Role       string
-	ModelName  string
-	CtxPercent int
-	width      int
+	Role          string
+	ModelName     string
+	ExecutionMode string
+	CtxPercent    int
+	width         int
 }
 
 func NewStatusBarModel() *StatusBarModel {
 	return &StatusBarModel{
-		Role:       "CODER",
-		ModelName:  "no-model-selected",
-		CtxPercent: 0,
+		Role:          "CODER",
+		ModelName:     "no-model-selected",
+		ExecutionMode: "FAST",
+		CtxPercent:    0,
 	}
 }
 
-func NewStatusBarModelWithConfig(_ *config.Config, _ *state.Session) *StatusBarModel {
-	return NewStatusBarModel()
+func NewStatusBarModelWithConfig(_ *config.Config, session *state.Session) *StatusBarModel {
+	m := NewStatusBarModel()
+	if session != nil {
+		mode := state.NormalizeExecutionMode(session.ExecutionMode)
+		m.ExecutionMode = strings.ToUpper(mode)
+	}
+	return m
 }
 
 func (m *StatusBarModel) Init() tea.Cmd { return nil }
@@ -51,6 +59,7 @@ func (m *StatusBarModel) SetWidth(w int) {
 func (m *StatusBarModel) View() string {
 	roleStr := sbRoleStyle.Render(fmt.Sprintf("[ROLE: %s]", m.Role))
 	modelStr := sbModelStyle.Render(fmt.Sprintf("[MODEL: %s]", m.ModelName))
+	modeStr := sbModelStyle.Render(fmt.Sprintf("[EXEC: %s]", m.ExecutionMode))
 
 	ctxStyle := sbCtxGreenStyle
 	if m.CtxPercent >= 80 {
@@ -60,6 +69,6 @@ func (m *StatusBarModel) View() string {
 	}
 	ctxStr := ctxStyle.Render(fmt.Sprintf("[CTX: %d%%]", m.CtxPercent))
 
-	s := fmt.Sprintf("%s | %s | %s", roleStr, modelStr, ctxStr)
+	s := fmt.Sprintf("%s | %s | %s | %s", roleStr, modelStr, modeStr, ctxStr)
 	return sbBaseStyle.Width(m.width).Render(s)
 }

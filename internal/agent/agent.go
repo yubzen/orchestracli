@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -22,26 +23,44 @@ const (
 )
 
 type Agent struct {
-	Role         Role
-	Model        string
-	Provider     providers.Provider
-	SystemPrompt string
-	AllowedTools []string
-	RAG          *rag.Store
-	Indexer      *rag.Indexer
+	Role             Role
+	Model            string
+	Provider         providers.Provider
+	SystemPrompt     string
+	TaskSystemPrompt string
+	ChatSystemPrompt string
+	AllowedTools     []string
+	ToolSet          ToolSet
+	RAG              *rag.Store
+	Indexer          *rag.Indexer
+}
+
+type RunOptions struct {
+	Mode    DispatchMode
+	OnToken func(token string)
 }
 
 var ErrAgentNotReady = errors.New("agent is not initialized")
 
 func NewAgent(role Role, model string, provider providers.Provider, store *rag.Store, indexer *rag.Indexer) *Agent {
+	toolSet := DefaultToolSetForRole(role, ToolEnv{
+		WorkingDir: ".",
+		Role:       role,
+	})
+	basePrompt := strings.TrimSpace(LoadSystemPrompt(string(role)))
+	taskPrompt := buildTaskSystemPrompt(role, basePrompt)
+	chatPrompt := buildChatSystemPrompt(role)
 	return &Agent{
-		Role:         role,
-		Model:        model,
-		Provider:     provider,
-		SystemPrompt: LoadSystemPrompt(string(role)),
-		AllowedTools: LoadAllowedTools(string(role)),
-		RAG:          store,
-		Indexer:      indexer,
+		Role:             role,
+		Model:            model,
+		Provider:         provider,
+		SystemPrompt:     chatPrompt,
+		TaskSystemPrompt: taskPrompt,
+		ChatSystemPrompt: chatPrompt,
+		AllowedTools:     toolSet.Names(),
+		ToolSet:          toolSet,
+		RAG:              store,
+		Indexer:          indexer,
 	}
 }
 
@@ -55,13 +74,78 @@ func (a *Agent) Validate() error {
 	if strings.TrimSpace(a.Model) == "" {
 		return fmt.Errorf("%s agent model is empty", a.Role)
 	}
-	if strings.TrimSpace(a.SystemPrompt) == "" {
+	if strings.TrimSpace(a.TaskSystemPrompt) == "" {
 		return fmt.Errorf("%s agent system prompt is empty", a.Role)
+	}
+	if strings.TrimSpace(a.ChatSystemPrompt) == "" {
+		return fmt.Errorf("%s agent chat prompt is empty", a.Role)
+	}
+	if strings.TrimSpace(a.SystemPrompt) == "" {
+		a.SystemPrompt = a.ChatSystemPrompt
+	}
+	if len(a.ToolSet.Names()) == 0 {
+		a.BindToolSet(ToolEnv{
+			WorkingDir: ".",
+			Role:       a.Role,
+		})
+	}
+	if len(a.ToolSet.Names()) == 0 {
+		return fmt.Errorf("%s agent tools are not configured", a.Role)
 	}
 	return nil
 }
 
+func (a *Agent) BindToolSet(env ToolEnv) {
+	if a == nil {
+		return
+	}
+	env.Role = a.Role
+	a.ToolSet = DefaultToolSetForRole(a.Role, env)
+	a.AllowedTools = a.ToolSet.Names()
+}
+
+func (a *Agent) SetSystemPrompt(prompt string) {
+	if a == nil {
+		return
+	}
+	a.SystemPrompt = strings.TrimSpace(prompt)
+}
+
+func (a *Agent) SetDispatchMode(mode DispatchMode) {
+	if a == nil {
+		return
+	}
+	mode = mode.Normalize()
+	switch mode {
+	case DispatchModeTask:
+		a.SetSystemPrompt(a.TaskSystemPrompt)
+	default:
+		a.SetSystemPrompt(a.ChatSystemPrompt)
+	}
+}
+
+func (a *Agent) ExecuteTool(ctx context.Context, name string, params map[string]any) (ToolResult, error) {
+	if a == nil {
+		return ToolResult{}, ErrAgentNotReady
+	}
+	tool, ok := a.ToolSet.Get(name)
+	if !ok {
+		return ToolResult{}, fmt.Errorf("%w: %s", errToolNotAllowed, strings.TrimSpace(name))
+	}
+	if tool.Execute == nil {
+		return ToolResult{}, fmt.Errorf("tool %q has no executor", tool.Name)
+	}
+	return tool.Execute(ctx, params)
+}
+
 func (a *Agent) Run(ctx context.Context, userPrompt string, session *state.Session, db *state.DB) (string, error) {
+	mode := dispatchModeForInput(userPrompt)
+	return a.RunWithOptions(ctx, userPrompt, session, db, RunOptions{
+		Mode: mode,
+	})
+}
+
+func (a *Agent) RunWithOptions(ctx context.Context, userPrompt string, session *state.Session, db *state.DB, options RunOptions) (string, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -72,9 +156,16 @@ func (a *Agent) Run(ctx context.Context, userPrompt string, session *state.Sessi
 	if err := a.Provider.Ping(ctx); err != nil {
 		return "", fmt.Errorf("%s agent provider is not ready: %w", a.Role, err)
 	}
+	dispatchMode := options.Mode
+	if strings.TrimSpace(string(dispatchMode)) == "" {
+		dispatchMode = dispatchModeForInput(userPrompt)
+	} else {
+		dispatchMode = dispatchMode.Normalize()
+	}
+	a.SetDispatchMode(dispatchMode)
 
 	var ragContext string
-	if a.Indexer != nil {
+	if dispatchMode == DispatchModeTask && a.Indexer != nil {
 		chunks, err := a.Indexer.Query(ctx, userPrompt)
 		if err == nil && len(chunks) > 0 {
 			var sb strings.Builder
@@ -86,8 +177,13 @@ func (a *Agent) Run(ctx context.Context, userPrompt string, session *state.Sessi
 		}
 	}
 
+	systemPrompt := strings.TrimSpace(a.SystemPrompt)
+	if promptBlock := strings.TrimSpace(a.ToolSet.PromptBlock()); promptBlock != "" {
+		systemPrompt = strings.TrimSpace(systemPrompt + "\n\n" + promptBlock)
+	}
+
 	messages := []providers.Message{
-		{Role: "system", Content: a.SystemPrompt},
+		{Role: "system", Content: systemPrompt},
 	}
 
 	if db != nil && session != nil {
@@ -117,19 +213,63 @@ func (a *Agent) Run(ctx context.Context, userPrompt string, session *state.Sessi
 		messages[i].Content = mcp.Clean(m.Content)
 	}
 
-	var pTools []providers.Tool
+	// Serialize agent tools into provider-compatible format.
+	pTools := a.ToolSet.ProviderTools()
 
-	reply, err := a.Provider.Complete(ctx, a.Model, messages, pTools)
-	if err != nil {
-		return "", err
+	// Agentic tool dispatch loop: send to LLM, execute tool calls, feed
+	// results back, repeat until the LLM returns a final text response.
+	const maxIterations = 25
+	var finalText string
+
+	for iteration := 0; iteration < maxIterations; iteration++ {
+		response, err := a.Provider.Complete(ctx, a.Model, messages, pTools, options.OnToken)
+		if err != nil {
+			return "", err
+		}
+
+		if !response.HasToolCalls() {
+			finalText = mcp.Clean(response.Text)
+			break
+		}
+
+		// Append the assistant message with tool calls to the conversation.
+		messages = append(messages, providers.Message{
+			Role:      "assistant",
+			Content:   response.Text,
+			ToolCalls: response.ToolCalls,
+		})
+
+		// Execute each tool call and append results.
+		for _, tc := range response.ToolCalls {
+			var params map[string]any
+			if len(tc.Arguments) > 0 {
+				if err := json.Unmarshal(tc.Arguments, &params); err != nil {
+					params = map[string]any{}
+				}
+			}
+
+			result, execErr := a.ExecuteTool(ctx, tc.Name, params)
+			var resultContent string
+			if execErr != nil {
+				resultContent = fmt.Sprintf("error: %s", execErr.Error())
+			} else {
+				resultContent = result.Output
+			}
+
+			messages = append(messages, providers.Message{
+				Role:       "tool",
+				Content:    resultContent,
+				ToolCallID: tc.ID,
+			})
+		}
+		// Continue the loop — the LLM will see the tool results and either
+		// call more tools or produce a final text response.
 	}
-
-	reply = mcp.Clean(reply)
 
 	if db != nil && session != nil {
 		_ = db.SaveMessage(ctx, session.ID, "user", string(a.Role), finalPrompt, 0)
-		_ = db.SaveMessage(ctx, session.ID, "assistant", string(a.Role), reply, 0)
+		_ = db.SaveMessage(ctx, session.ID, "assistant", string(a.Role), finalText, 0)
 	}
 
-	return reply, nil
+	return finalText, nil
 }

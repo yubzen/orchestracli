@@ -122,6 +122,7 @@ orchestra stats
 # Session/state controls
 orchestra session list
 orchestra session resume <session-id>
+orchestra -s <session-id>
 orchestra db
 orchestra db query "SELECT id, mode FROM sessions ORDER BY created_at DESC LIMIT 10"
 orchestra db clear-index

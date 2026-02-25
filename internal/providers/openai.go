@@ -1,6 +1,7 @@
 package providers
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -13,9 +14,10 @@ import (
 )
 
 type OpenAI struct {
-	BaseURL string
-	KeyName string // e.g., "openai" or "deepseek"
-	Client  *http.Client
+	BaseURL      string
+	KeyName      string // e.g., "openai" or "deepseek"
+	Client       *http.Client
+	ExtraHeaders map[string]string
 }
 
 func NewOpenAI(baseURL, keyName string) *OpenAI {
@@ -26,9 +28,10 @@ func NewOpenAI(baseURL, keyName string) *OpenAI {
 		keyName = "openai"
 	}
 	return &OpenAI{
-		BaseURL: strings.TrimRight(baseURL, "/"),
-		KeyName: keyName,
-		Client:  &http.Client{},
+		BaseURL:      strings.TrimRight(baseURL, "/"),
+		KeyName:      keyName,
+		Client:       &http.Client{},
+		ExtraHeaders: nil,
 	}
 }
 
@@ -60,6 +63,12 @@ func (p *OpenAI) ListModels(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+key)
+	for k, v := range p.ExtraHeaders {
+		if strings.TrimSpace(k) == "" || strings.TrimSpace(v) == "" {
+			continue
+		}
+		req.Header.Set(k, v)
+	}
 
 	resp, err := p.Client.Do(req)
 	if err != nil {
@@ -68,7 +77,11 @@ func (p *OpenAI) ListModels(ctx context.Context) ([]string, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to list models, status %d", resp.StatusCode)
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			return nil, &ProviderAuthError{ProviderName: p.KeyName, Msg: "Unauthorized: Invalid API key"}
+		}
+		return nil, fmt.Errorf("failed to list models, status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
 	var result struct {
@@ -84,32 +97,60 @@ func (p *OpenAI) ListModels(ctx context.Context) ([]string, error) {
 	for _, m := range result.Data {
 		models = append(models, m.ID)
 	}
-	if len(models) == 0 {
-		models = []string{"gpt-4o", "gpt-4-turbo"} // Fallback
-	}
 	return models, nil
 }
 
-func (p *OpenAI) Complete(ctx context.Context, model string, messages []Message, tools []Tool) (string, error) {
+func (p *OpenAI) Complete(ctx context.Context, model string, messages []Message, tools []Tool, onToken TokenCallback) (CompletionResponse, error) {
 	key, err := p.getKey()
 	if err != nil {
-		return "", err
+		return CompletionResponse{}, err
 	}
 
-	var reqMessages []map[string]string
+	var reqMessages []map[string]interface{}
 	for _, m := range messages {
-		reqMessages = append(reqMessages, map[string]string{
+		if m.Role == "tool" {
+			reqMessages = append(reqMessages, map[string]interface{}{
+				"role":         "tool",
+				"content":      m.Content,
+				"tool_call_id": m.ToolCallID,
+			})
+			continue
+		}
+		if m.Role == "assistant" && len(m.ToolCalls) > 0 {
+			var openaiToolCalls []map[string]interface{}
+			for _, tc := range m.ToolCalls {
+				openaiToolCalls = append(openaiToolCalls, map[string]interface{}{
+					"id":   tc.ID,
+					"type": "function",
+					"function": map[string]interface{}{
+						"name":      tc.Name,
+						"arguments": string(tc.Arguments),
+					},
+				})
+			}
+			msg := map[string]interface{}{
+				"role":       "assistant",
+				"tool_calls": openaiToolCalls,
+			}
+			if strings.TrimSpace(m.Content) != "" {
+				msg["content"] = m.Content
+			}
+			reqMessages = append(reqMessages, msg)
+			continue
+		}
+		reqMessages = append(reqMessages, map[string]interface{}{
 			"role":    m.Role,
 			"content": m.Content,
 		})
 	}
 
+	hasTools := len(tools) > 0
 	payload := map[string]interface{}{
 		"model":    model,
 		"messages": reqMessages,
 	}
 
-	if len(tools) > 0 {
+	if hasTools {
 		var openaiTools []map[string]interface{}
 		for _, t := range tools {
 			openaiTools = append(openaiTools, map[string]interface{}{
@@ -122,47 +163,163 @@ func (p *OpenAI) Complete(ctx context.Context, model string, messages []Message,
 			})
 		}
 		payload["tools"] = openaiTools
+		// Non-streaming for tool calls to simplify parsing.
+		payload["stream"] = false
+	} else {
+		payload["stream"] = true
 	}
 
 	bodyBytes, err := json.Marshal(payload)
 	if err != nil {
-		return "", err
+		return CompletionResponse{}, err
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", p.BaseURL+"/chat/completions", bytes.NewBuffer(bodyBytes))
 	if err != nil {
-		return "", err
+		return CompletionResponse{}, err
 	}
 	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("Content-Type", "application/json")
+	for k, v := range p.ExtraHeaders {
+		if strings.TrimSpace(k) == "" || strings.TrimSpace(v) == "" {
+			continue
+		}
+		req.Header.Set(k, v)
+	}
 
 	resp, err := p.Client.Do(req)
 	if err != nil {
-		return "", err
+		return CompletionResponse{}, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode == http.StatusUnauthorized {
-			return "", &ProviderAuthError{ProviderName: p.KeyName, Msg: "Unauthorized: Invalid API key"}
+			return CompletionResponse{}, &ProviderAuthError{ProviderName: p.KeyName, Msg: "Unauthorized: Invalid API key"}
 		}
-		return "", fmt.Errorf("openai compat error: %s (status %d)", string(body), resp.StatusCode)
+		return CompletionResponse{}, fmt.Errorf("openai compat error: %s (status %d)", string(body), resp.StatusCode)
 	}
 
+	// Streaming text-only path.
+	contentType := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Type")))
+	if !hasTools && strings.Contains(contentType, "text/event-stream") {
+		text, err := readOpenAIStream(resp.Body, onToken)
+		if err != nil {
+			return CompletionResponse{}, err
+		}
+		return CompletionResponse{Text: text, StopReason: "stop"}, nil
+	}
+
+	// Non-streaming path — parse full response including tool calls.
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return CompletionResponse{}, err
+	}
+	return decodeOpenAIFullResponse(body, onToken)
+}
+
+func readOpenAIStream(body io.Reader, onToken TokenCallback) (string, error) {
+	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+
+	var out strings.Builder
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" {
+			continue
+		}
+		if payload == "[DONE]" {
+			break
+		}
+
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+				Message struct {
+					Content string `json:"content"`
+				} `json:"message"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			continue
+		}
+		for _, choice := range chunk.Choices {
+			token := choice.Delta.Content
+			if token == "" {
+				token = choice.Message.Content
+			}
+			if token == "" {
+				continue
+			}
+			out.WriteString(token)
+			if onToken != nil {
+				onToken(token)
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", err
+	}
+	result := strings.TrimSpace(out.String())
+	if result == "" {
+		return "", fmt.Errorf("empty response")
+	}
+	return result, nil
+}
+
+// decodeOpenAIFullResponse parses a non-streaming OpenAI response, extracting
+// both message content and tool call blocks.
+func decodeOpenAIFullResponse(body []byte, onToken TokenCallback) (CompletionResponse, error) {
 	var result struct {
 		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
+			FinishReason string `json:"finish_reason"`
+			Message      struct {
+				Content   string `json:"content"`
+				ToolCalls []struct {
+					ID       string `json:"id"`
+					Type     string `json:"type"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
 			} `json:"message"`
 		} `json:"choices"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", err
+	if err := json.Unmarshal(body, &result); err != nil {
+		return CompletionResponse{}, err
+	}
+	if len(result.Choices) == 0 {
+		return CompletionResponse{}, fmt.Errorf("empty response")
 	}
 
-	if len(result.Choices) > 0 {
-		return result.Choices[0].Message.Content, nil
+	choice := result.Choices[0]
+	resp := CompletionResponse{
+		Text:       strings.TrimSpace(choice.Message.Content),
+		StopReason: choice.FinishReason,
 	}
-	return "", fmt.Errorf("empty response")
+
+	for _, tc := range choice.Message.ToolCalls {
+		resp.ToolCalls = append(resp.ToolCalls, ToolCall{
+			ID:        tc.ID,
+			Name:      tc.Function.Name,
+			Arguments: json.RawMessage(tc.Function.Arguments),
+		})
+	}
+
+	if resp.Text != "" && onToken != nil {
+		onToken(resp.Text)
+	}
+
+	if len(resp.ToolCalls) == 0 && resp.Text == "" {
+		return CompletionResponse{}, fmt.Errorf("empty response")
+	}
+	return resp, nil
 }

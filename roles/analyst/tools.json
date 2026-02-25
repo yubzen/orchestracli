@@ -1,6 +1,6 @@
 {
-    "allowed": [
-        "read_file",
-        "list_dir"
-    ]
+  "allowed": [
+    "read_file",
+    "run_command"
+  ]
 }

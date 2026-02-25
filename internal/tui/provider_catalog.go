@@ -5,101 +5,140 @@ import (
 	"strings"
 
 	"github.com/zalando/go-keyring"
+
+	"github.com/yubzen/orchestra/internal/config"
+	"github.com/yubzen/orchestra/internal/providers"
 )
 
 const keyringService = "orchestra"
 
+type AuthMethodKind string
+
+const (
+	AuthMethodAPIKey AuthMethodKind = "api_key"
+)
+
 type AuthMethod struct {
-	Name      string
-	Available bool
+	Name       string
+	Kind       AuthMethodKind
+	Available  bool
+	InputLabel string
+	InputHint  string
 }
 
 type ProviderCatalog struct {
 	Name      string
 	KeyName   string
-	Models    []string
+	Discovery providers.DiscoveryConfig
 	AuthModes []AuthMethod
 }
 
-func defaultProviderCatalog() []ProviderCatalog {
-	return []ProviderCatalog{
+func defaultProviderCatalog(cfg *config.Config) []ProviderCatalog {
+	openAIBaseURL := "https://api.openai.com/v1"
+	if cfg != nil && strings.TrimSpace(cfg.Providers.OpenAI.BaseURL) != "" {
+		openAIBaseURL = strings.TrimSpace(cfg.Providers.OpenAI.BaseURL)
+	}
+
+	catalog := []ProviderCatalog{
 		{
 			Name:    "Anthropic",
 			KeyName: "anthropic",
-			Models: []string{
-				"claude-3-opus-20240229",
-				"claude-3-7-sonnet-latest",
-				"claude-3-5-sonnet-20241022",
+			Discovery: providers.DiscoveryConfig{
+				Kind: providers.DiscoveryKindAnthropic,
 			},
 			AuthModes: []AuthMethod{
-				{Name: "Manually enter API Key", Available: true},
+				{
+					Name:       "Manually enter API Key",
+					Kind:       AuthMethodAPIKey,
+					Available:  true,
+					InputLabel: "API key",
+					InputHint:  "Paste your provider API key.",
+				},
 			},
 		},
 		{
 			Name:    "OpenAI",
 			KeyName: "openai",
-			Models: []string{
-				"gpt-4o",
-				"gpt-4.1",
-				"gpt-4.1-mini",
+			Discovery: providers.DiscoveryConfig{
+				Kind:    providers.DiscoveryKindOpenAICompat,
+				KeyName: "openai",
+				BaseURL: openAIBaseURL,
 			},
 			AuthModes: []AuthMethod{
-				{Name: "ChatGPT Pro/Plus (browser)", Available: false},
-				{Name: "ChatGPT Pro/Plus (headless)", Available: false},
-				{Name: "Manually enter API Key", Available: true},
+				{
+					Name:       "Manually enter API Key",
+					Kind:       AuthMethodAPIKey,
+					Available:  true,
+					InputLabel: "API key",
+					InputHint:  "Paste your provider API key.",
+				},
 			},
 		},
 		{
-			Name:    "Google",
-			KeyName: "google",
-			Models: []string{
-				"gemini-2.5-pro",
-				"gemini-2.5-flash",
-				"gemini-1.5-pro",
+			Name:    "OpenRouter",
+			KeyName: "openrouter",
+			Discovery: providers.DiscoveryConfig{
+				Kind:    providers.DiscoveryKindOpenRouter,
+				KeyName: "openrouter",
+				BaseURL: "https://openrouter.ai/api/v1",
 			},
 			AuthModes: []AuthMethod{
-				{Name: "Manually enter API Key", Available: true},
+				{
+					Name:       "Manually enter API Key",
+					Kind:       AuthMethodAPIKey,
+					Available:  true,
+					InputLabel: "API key",
+					InputHint:  "300+ models from every major provider. Free tier available.",
+				},
 			},
 		},
 		{
 			Name:    "xAI",
 			KeyName: "xai",
-			Models: []string{
-				"grok-2-1212",
-				"grok-beta",
+			Discovery: providers.DiscoveryConfig{
+				Kind:    providers.DiscoveryKindOpenAICompat,
+				KeyName: "xai",
+				BaseURL: "https://api.x.ai/v1",
 			},
 			AuthModes: []AuthMethod{
-				{Name: "Manually enter API Key", Available: true},
+				{
+					Name:       "Manually enter API Key",
+					Kind:       AuthMethodAPIKey,
+					Available:  true,
+					InputLabel: "API key",
+					InputHint:  "Paste your provider API key.",
+				},
 			},
 		},
 	}
-}
 
-func hasProviderKey(keyName string) bool {
-	key, err := keyring.Get(keyringService, keyName)
-	return err == nil && strings.TrimSpace(key) != ""
+	return catalog
 }
 
 func storeProviderKey(keyName, key string) error {
 	return keyring.Set(keyringService, keyName, strings.TrimSpace(key))
 }
 
-func connectedModels(catalog []ProviderCatalog) []string {
-	var models []string
-	for _, provider := range catalog {
-		if !hasProviderKey(provider.KeyName) {
-			continue
-		}
-		models = append(models, provider.Models...)
+func storedProviderKey(keyName string) string {
+	key, err := keyring.Get(keyringService, strings.TrimSpace(keyName))
+	if err != nil {
+		return ""
 	}
+	return strings.TrimSpace(key)
+}
 
-	seen := make(map[string]bool, len(models))
-	var unique []string
+func uniqueSortedModels(models []string) []string {
+	seen := make(map[string]struct{}, len(models))
+	unique := make([]string, 0, len(models))
 	for _, model := range models {
-		if seen[model] {
+		model = strings.TrimSpace(model)
+		if model == "" {
 			continue
 		}
-		seen[model] = true
+		if _, ok := seen[model]; ok {
+			continue
+		}
+		seen[model] = struct{}{}
 		unique = append(unique, model)
 	}
 	sort.Strings(unique)

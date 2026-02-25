@@ -32,6 +32,11 @@ func migrate(db *sql.DB) error {
 		working_dir TEXT,
 		mode TEXT
 	);
+	CREATE TABLE IF NOT EXISTS session_settings (
+		session_id TEXT PRIMARY KEY,
+		execution_mode TEXT NOT NULL DEFAULT 'fast',
+		updated_at DATETIME
+	);
 	CREATE TABLE IF NOT EXISTS messages (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		session_id TEXT,
@@ -55,6 +60,14 @@ func migrate(db *sql.DB) error {
 		output TEXT,
 		status TEXT,
 		created_at DATETIME
+	);
+	CREATE TABLE IF NOT EXISTS session_model_selections (
+		session_id TEXT NOT NULL,
+		role TEXT NOT NULL,
+		provider_key TEXT NOT NULL,
+		model_id TEXT NOT NULL,
+		updated_at DATETIME,
+		PRIMARY KEY (session_id, role)
 	);`
 	_, err := db.Exec(schema)
 	return err
@@ -65,8 +78,14 @@ func (db *DB) Close() error {
 }
 
 type Session struct {
-	ID         string
-	CreatedAt  time.Time
-	WorkingDir string
-	Mode       string
+	ID            string
+	CreatedAt     time.Time
+	WorkingDir    string
+	Mode          string
+	ExecutionMode string
 }
+
+const (
+	ExecutionModeFast = "fast"
+	ExecutionModePlan = "plan"
+)
