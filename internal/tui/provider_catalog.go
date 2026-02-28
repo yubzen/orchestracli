@@ -4,13 +4,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/zalando/go-keyring"
-
 	"github.com/yubzen/orchestra/internal/config"
 	"github.com/yubzen/orchestra/internal/providers"
 )
-
-const keyringService = "orchestra"
 
 type AuthMethodKind string
 
@@ -116,11 +112,11 @@ func defaultProviderCatalog(cfg *config.Config) []ProviderCatalog {
 }
 
 func storeProviderKey(keyName, key string) error {
-	return keyring.Set(keyringService, keyName, strings.TrimSpace(key))
+	return providers.StoreCredential(keyName, strings.TrimSpace(key))
 }
 
 func storedProviderKey(keyName string) string {
-	key, err := keyring.Get(keyringService, strings.TrimSpace(keyName))
+	key, err := providers.LoadCredential(strings.TrimSpace(keyName))
 	if err != nil {
 		return ""
 	}

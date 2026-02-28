@@ -11,14 +11,15 @@ import (
 )
 
 var (
+	planModalBG       = lipgloss.Color("235")
 	planModalBoxStyle = lipgloss.NewStyle().
 				Border(lipgloss.RoundedBorder()).
 				BorderForeground(lipgloss.Color("75")).
-				Background(lipgloss.Color("235")).
+				Background(planModalBG).
 				Padding(1, 2)
-	planModalTitleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("81")).Bold(true)
-	planModalHintStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
-	planModalBodyStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+	planModalTitleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("81")).Background(planModalBG).Bold(true)
+	planModalHintStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Background(planModalBG)
+	planModalBodyStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Background(planModalBG)
 )
 
 type PlanReviewAction struct {

@@ -24,9 +24,17 @@ var (
 )
 
 var loadProviderCredential = storedProviderKey
+var newDiscoveryProvider = providers.NewDiscoveryProvider
 
 type ModelsFetchedMsg struct {
 	RequestID    int
+	ProviderName string
+	ProviderKey  string
+	Models       []string
+	Err          error
+}
+
+type ProviderRestoreResultMsg struct {
 	ProviderName string
 	ProviderKey  string
 	Models       []string
@@ -56,36 +64,48 @@ type AppModel struct {
 	roleProviderKeys  map[string]string
 	thinkingStarted   map[agent.Role]time.Time
 	thinkingBuffer    map[agent.Role]string
+	inputHistory      []string
+	inputHistoryIndex int
+	inputDraft        string
+	historyBrowsing   bool
 	activeRole        int
 	width             int
 	height            int
 	nextConnectReqID  int
 	activeConnectReq  int
 	pendingMessages   []string
+	agentRunActive    bool
+	agentRunCancel    context.CancelFunc
+	cancelRequested   bool
+	repoPath          string
+	repoDisplayPath   string
+	restoreIssues     map[string]string
 }
 
 func NewAppModel(cfg *config.Config, db *state.DB, session *state.Session, orc *agent.Orchestrator) *AppModel {
 	chat := NewChatModel()
 	sb := NewStatusBarModelWithConfig(cfg, session)
-	roleOrder := []string{"CODER", "REVIEWER", "PLANNER"}
+	repoPath := detectRepoPath(session)
+	repoDisplayPath := displayRepoPath(repoPath)
+	roleOrder := []string{"PLANNER", "CODER", "REVIEWER"}
 	roleModels := map[string]string{
+		"PLANNER":  "",
 		"CODER":    "",
 		"REVIEWER": "",
-		"PLANNER":  "",
 	}
 	roleProviders := map[string]string{
+		"PLANNER":  "",
 		"CODER":    "",
 		"REVIEWER": "",
-		"PLANNER":  "",
 	}
 
 	modelsModal := NewModelsModal(nil)
 	planModal := NewPlanReviewModal()
-	roleModal := NewSelectModal("Select Role", "up/down: navigate  enter: select  esc: close")
+	roleModal := NewSelectModal("Configure Role", "up/down: navigate  enter: configure model  esc: close")
 	roleModal.SetOptions([]SelectOption{
+		{Label: "PLANNER", Enabled: true},
 		{Label: "CODER", Enabled: true},
 		{Label: "REVIEWER", Enabled: true},
-		{Label: "PLANNER", Enabled: true},
 	})
 
 	model := &AppModel{
@@ -111,18 +131,27 @@ func NewAppModel(cfg *config.Config, db *state.DB, session *state.Session, orc *
 		thinkingStarted:   make(map[agent.Role]time.Time),
 		thinkingBuffer:    make(map[agent.Role]string),
 		activeRole:        0,
+		repoPath:          repoPath,
+		repoDisplayPath:   repoDisplayPath,
+		restoreIssues:     make(map[string]string),
 	}
+	model.statusbar.SetRepoPath(repoDisplayPath)
 	model.loadPersistedSessionSelections()
+	model.collectMissingCredentialIssues()
+	model.updateRestoreHint()
+	model.loadPersistedInputHistory()
 	model.syncExecutionModeFromSession()
 	model.refreshConnectOptions()
 	model.refreshModelsModal("")
 	model.syncRoleAndModelDisplay()
+	model.resetInputHistoryNavigation()
 	return model
 }
 
 func (m *AppModel) Init() tea.Cmd {
 	var cmds []tea.Cmd
 	cmds = append(cmds, m.chat.Init(), m.statusbar.Init(), textinput.Blink)
+	cmds = append(cmds, m.startupProviderRestoreCmds()...)
 	if m.orc != nil && m.orc.UpdateChan != nil {
 		cmds = append(cmds, waitForStepUpdate(m.orc.UpdateChan))
 	}
@@ -143,7 +172,7 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.planModal != nil && m.planModal.Visible {
 			switch msg.String() {
 			case "ctrl+c":
-				return m, tea.Quit
+				return m.handleCtrlC()
 			}
 
 			action, cmd := m.planModal.Update(msg)
@@ -173,7 +202,7 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.apiKeyModal != nil && m.apiKeyModal.Visible {
 			switch msg.String() {
 			case "ctrl+c":
-				return m, tea.Quit
+				return m.handleCtrlC()
 			case "esc":
 				m.activeConnectReq = 0
 				m.modelsModal.ClearLoading()
@@ -220,18 +249,16 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		if handled, cmd := m.dispatchUpDownKey(msg); handled {
+			return m, cmd
+		}
+
 		if m.authMethodModal != nil && m.authMethodModal.Visible {
 			switch msg.String() {
 			case "ctrl+c":
-				return m, tea.Quit
+				return m.handleCtrlC()
 			case "esc":
 				m.authMethodModal.Close()
-				return m, nil
-			case "up":
-				m.authMethodModal.Move(-1)
-				return m, nil
-			case "down":
-				m.authMethodModal.Move(1)
 				return m, nil
 			case "enter":
 				opt, ok := m.authMethodModal.SelectedOption()
@@ -260,15 +287,9 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.connectModal != nil && m.connectModal.Visible {
 			switch msg.String() {
 			case "ctrl+c":
-				return m, tea.Quit
+				return m.handleCtrlC()
 			case "esc":
 				m.connectModal.Close()
-				return m, nil
-			case "up":
-				m.connectModal.Move(-1)
-				return m, nil
-			case "down":
-				m.connectModal.Move(1)
 				return m, nil
 			case "enter":
 				opt, ok := m.connectModal.SelectedOption()
@@ -307,15 +328,9 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.rolesModal != nil && m.rolesModal.Visible {
 			switch msg.String() {
 			case "ctrl+c":
-				return m, tea.Quit
+				return m.handleCtrlC()
 			case "esc":
 				m.rolesModal.Close()
-				return m, nil
-			case "up":
-				m.rolesModal.Move(-1)
-				return m, nil
-			case "down":
-				m.rolesModal.Move(1)
 				return m, nil
 			case "enter":
 				opt, ok := m.rolesModal.SelectedOption()
@@ -323,6 +338,11 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.setActiveRole(opt.Label)
 				}
 				m.rolesModal.Close()
+				if m.modelsModal != nil {
+					m.refreshModelsModal("")
+					m.modelsModal.SelectByProviderAndModel(m.roleProviderKeys[m.currentRole()], m.currentRoleModel())
+					m.modelsModal.Open()
+				}
 				return m, nil
 			default:
 				return m, nil
@@ -332,7 +352,7 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.modelsModal != nil && m.modelsModal.Visible {
 			switch msg.String() {
 			case "ctrl+c":
-				return m, tea.Quit
+				return m.handleCtrlC()
 			case "esc":
 				m.modelsModal.Close()
 				return m, nil
@@ -356,7 +376,23 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		switch msg.String() {
 		case "ctrl+c":
-			return m, tea.Quit
+			return m.handleCtrlC()
+		case "esc":
+			if strings.TrimSpace(m.chat.GetInputValue()) == "" && m.agentRunActive {
+				if !m.cancelRequested {
+					m.cancelRequested = true
+					m.chat.AddMessage("System", "● Cancellation requested. Stopping current run...")
+					if m.statusbar != nil {
+						m.statusbar.SetRoleState("PLANNER", "cancelling")
+						m.statusbar.SetRoleState("CODER", "cancelling")
+						m.statusbar.SetRoleState("REVIEWER", "cancelling")
+					}
+					if m.agentRunCancel != nil {
+						m.agentRunCancel()
+					}
+				}
+				return m, nil
+			}
 		case "p":
 			if strings.TrimSpace(m.chat.GetInputValue()) == "" {
 				modeMsg := m.toggleExecutionMode()
@@ -364,21 +400,18 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return CommandResultMsg{Msg: modeMsg}
 				}
 			}
+		case "shift+tab":
+			modeMsg := m.toggleExecutionMode()
+			return m, func() tea.Msg {
+				return CommandResultMsg{Msg: modeMsg}
+			}
 		case "tab":
 			if m.chat.ApplyTopSlashSuggestion() {
 				return m, nil
 			}
-		case "shift+tab":
-			m.cycleRole(1)
-			return m, nil
-		case "up":
-			if m.chat.MoveSlashSelection(-1) {
-				return m, nil
-			}
-		case "down":
-			if m.chat.MoveSlashSelection(1) {
-				return m, nil
-			}
+		}
+		if shouldResetHistoryNavigation(msg) {
+			m.resetInputHistoryNavigation()
 		}
 
 	case tea.WindowSizeMsg:
@@ -427,30 +460,54 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, waitForAgentEvent(m.orc.EventChan))
 		}
 
-	case AgentReplyMsg:
+	case AgentRunResultMsg:
 		m.chat.SetLoading(false, "")
-		roleLabel := strings.ToUpper(strings.TrimSpace(msg.Role))
-		if roleLabel == "" {
-			roleLabel = m.currentRole()
+		m.clearAgentRunState()
+		if m.statusbar != nil {
+			m.statusbar.ResetTeamActivity()
 		}
-		m.chat.AddMessage(roleLabel, msg.Reply)
-		// Drain pending queue.
-		if len(m.pendingMessages) > 0 {
+
+		shouldDrain := true
+		if msg.Err != nil {
+			if agent.IsUserCancelled(msg.Err) {
+				shouldDrain = false
+				m.pendingMessages = nil
+				m.chat.AddMessage("System", "✓ Run cancelled by user. Input is ready.")
+			} else {
+				roleLabel := strings.ToLower(strings.TrimSpace(msg.Role))
+				if roleLabel == "" {
+					roleLabel = "agent"
+				}
+				m.chat.AddMessage("System", fmt.Sprintf("%s error: %v", roleLabel, msg.Err))
+			}
+		} else if strings.TrimSpace(msg.Reply) != "" {
+			roleLabel := strings.ToUpper(strings.TrimSpace(msg.Role))
+			if roleLabel == "" {
+				roleLabel = "ORCHESTRATOR"
+			}
+			m.chat.AddMessage(roleLabel, msg.Reply)
+		}
+
+		if shouldDrain && len(m.pendingMessages) > 0 {
 			next := m.pendingMessages[0]
 			m.pendingMessages = m.pendingMessages[1:]
-			m.chat.SetLoading(true, m.currentRole())
-			cmds = append(cmds, m.runAgentCmd(next), loadingTickCmd())
+			runCtx := m.startAgentRunContext()
+			m.chat.SetLoading(true, "ORCHESTRATOR")
+			cmds = append(cmds, m.runAgentCmd(runCtx, next), loadingTickCmd())
 		}
 
 	case CommandResultMsg:
-		m.chat.SetLoading(false, "")
+		if !m.agentRunActive {
+			m.chat.SetLoading(false, "")
+		}
 		m.chat.AddMessage("System", msg.Msg)
 		// Drain pending queue on command results too.
-		if len(m.pendingMessages) > 0 {
+		if !m.agentRunActive && len(m.pendingMessages) > 0 {
 			next := m.pendingMessages[0]
 			m.pendingMessages = m.pendingMessages[1:]
-			m.chat.SetLoading(true, m.currentRole())
-			cmds = append(cmds, m.runAgentCmd(next), loadingTickCmd())
+			runCtx := m.startAgentRunContext()
+			m.chat.SetLoading(true, "ORCHESTRATOR")
+			cmds = append(cmds, m.runAgentCmd(runCtx, next), loadingTickCmd())
 		}
 
 	case LoadingTickMsg:
@@ -459,16 +516,10 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case OpenModelsModalMsg:
-		if m.modelsModal != nil {
-			m.refreshModelsModal("")
-			m.modelsModal.SelectByProviderAndModel(m.roleProviderKeys[m.currentRole()], m.currentRoleModel())
-			m.modelsModal.Open()
-		}
+		m.openModelRolePicker()
 
 	case OpenRolesModalMsg:
-		if m.rolesModal != nil {
-			m.rolesModal.Open()
-		}
+		m.openModelRolePicker()
 
 	case OpenConnectModalMsg:
 		if m.connectModal != nil {
@@ -486,6 +537,8 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.Err != nil {
 			m.setProviderConnected(msg.ProviderKey, false)
+			m.restoreIssues[strings.ToLower(strings.TrimSpace(msg.ProviderKey))] = fmt.Sprintf("%s needs reconnect", strings.TrimSpace(msg.ProviderName))
+			m.updateRestoreHint()
 			if m.apiKeyModal != nil && m.apiKeyModal.Visible {
 				m.apiKeyModal.SetError(msg.Err.Error())
 			}
@@ -495,6 +548,8 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		delete(m.restoreIssues, strings.ToLower(strings.TrimSpace(msg.ProviderKey)))
+		m.updateRestoreHint()
 		m.discoveredModels[msg.ProviderKey] = uniqueSortedModels(msg.Models)
 		m.setProviderConnected(msg.ProviderKey, true)
 		m.refreshConnectOptions()
@@ -517,33 +572,63 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				Msg: fmt.Sprintf("%s connected successfully. Discovered %d model(s).", msg.ProviderName, len(msg.Models)),
 			}
 		}
+
+	case ProviderRestoreResultMsg:
+		if msg.Err != nil {
+			m.setProviderConnected(msg.ProviderKey, false)
+			m.restoreIssues[strings.ToLower(strings.TrimSpace(msg.ProviderKey))] = fmt.Sprintf("%s needs reconnect", strings.TrimSpace(msg.ProviderName))
+			m.updateRestoreHint()
+			m.refreshConnectOptions()
+			m.syncRoleAndModelDisplay()
+			return m, nil
+		}
+
+		delete(m.restoreIssues, strings.ToLower(strings.TrimSpace(msg.ProviderKey)))
+		m.discoveredModels[msg.ProviderKey] = uniqueSortedModels(msg.Models)
+		m.setProviderConnected(msg.ProviderKey, true)
+		m.updateRestoreHint()
+		m.refreshConnectOptions()
+		m.refreshModelsModal(msg.ProviderKey)
+		m.syncRoleAndModelDisplay()
+		return m, nil
 	}
 
 	if msgKey, ok := msg.(tea.KeyMsg); ok && msgKey.String() == "enter" {
 		if selected, ok := m.chat.SelectedSlashSuggestion(); ok {
+			m.appendInputHistory(selected.Name)
 			cmds = append(cmds, handleSlashCommand(selected.Name, m))
 			m.chat.ClearInput()
+			m.resetInputHistoryNavigation()
 			return m, tea.Batch(cmds...)
 		}
 
-		val := m.chat.GetInputValue()
-		if val != "" {
-			if strings.HasPrefix(val, "/") {
-				cmds = append(cmds, handleSlashCommand(val, m))
+		trimmedInput, isCommand := classifyUserInput(m.chat.GetInputValue())
+		if trimmedInput != "" {
+			if isCommand {
+				m.appendInputHistory(trimmedInput)
+				cmds = append(cmds, handleSlashCommand(trimmedInput, m))
 				m.chat.ClearInput()
+				m.resetInputHistoryNavigation()
 			} else {
+				if !m.hasPlannerModelSelected() {
+					m.chat.AddMessage("System", "Planner model is not configured. Run /connect, then /models and assign Planner before sending prompts.")
+					return m, tea.Batch(cmds...)
+				}
 				// Expand @file references and show original in chat.
-				expanded := expandFileReferences(val)
-				m.chat.AddMessage("User", val)
+				expanded := expandFileReferences(trimmedInput)
+				m.appendInputHistory(trimmedInput)
+				m.chat.AddMessage("User", trimmedInput)
 				m.chat.ClearInput()
+				m.resetInputHistoryNavigation()
 
 				if m.chat.IsLoading() {
 					// Queue the message if the agent is still processing.
 					m.pendingMessages = append(m.pendingMessages, expanded)
 					m.chat.AddMessage("System", "⏳ Queued — will send after current response.")
 				} else {
-					m.chat.SetLoading(true, m.currentRole())
-					cmds = append(cmds, m.runAgentCmd(expanded), loadingTickCmd())
+					runCtx := m.startAgentRunContext()
+					m.chat.SetLoading(true, "ORCHESTRATOR")
+					cmds = append(cmds, m.runAgentCmd(runCtx, expanded), loadingTickCmd())
 				}
 			}
 		}
@@ -560,50 +645,80 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
-func (m *AppModel) runAgentCmd(prompt string) tea.Cmd {
-	return func() tea.Msg {
-		if m.orc == nil {
-			return CommandResultMsg{Msg: "orchestrator is not initialized"}
+func (m *AppModel) handleCtrlC() (tea.Model, tea.Cmd) {
+	if strings.TrimSpace(m.chat.GetInputValue()) != "" {
+		m.chat.ClearInput()
+		return m, nil
+	}
+	if m.agentRunActive && m.agentRunCancel != nil {
+		if !m.cancelRequested {
+			m.cancelRequested = true
+			m.chat.AddMessage("System", "● Cancellation requested. Stopping current run...")
+			if m.statusbar != nil {
+				m.statusbar.SetRoleState("PLANNER", "cancelling")
+				m.statusbar.SetRoleState("CODER", "cancelling")
+				m.statusbar.SetRoleState("REVIEWER", "cancelling")
+			}
+			m.agentRunCancel()
 		}
-		if !m.hasAnyModelSelected() {
-			return CommandResultMsg{Msg: "no AI selected"}
-		}
+		return m, nil
+	}
+	return m, tea.Quit
+}
 
-		if m.session.Mode == "orchestrated" {
-			go func() {
-				if err := m.orc.Run(context.Background(), prompt); err != nil && m.orc.UpdateChan != nil {
-					select {
-					case m.orc.UpdateChan <- agent.StepUpdate{StepID: "orchestrator", Status: "failed", Msg: err.Error()}:
-					default:
-					}
-				}
-			}()
-			return nil
-		}
+func (m *AppModel) startAgentRunContext() context.Context {
+	if m.agentRunCancel != nil {
+		m.agentRunCancel()
+	}
+	runCtx, cancel := context.WithCancel(context.Background())
+	m.agentRunActive = true
+	m.agentRunCancel = cancel
+	m.cancelRequested = false
+	return runCtx
+}
 
-		currentRole := m.currentRole()
-		selectedModel := strings.TrimSpace(m.roleModels[currentRole])
-		selectedProvider := strings.TrimSpace(m.roleProviderKeys[currentRole])
-		if selectedModel == "" || selectedProvider == "" {
-			return CommandResultMsg{Msg: "no AI selected"}
-		}
-
-		activeAgent := m.agentForRole(currentRole)
-		if activeAgent == nil {
-			return CommandResultMsg{Msg: fmt.Sprintf("role %s is not available", currentRole)}
-		}
-
-		reply, err := activeAgent.Run(context.Background(), prompt, m.session, m.db)
-		if err != nil {
-			return CommandResultMsg{Msg: fmt.Sprintf("%s error: %v", strings.ToLower(currentRole), err)}
-		}
-		return AgentReplyMsg{Reply: reply, Role: currentRole}
+func (m *AppModel) clearAgentRunState() {
+	m.agentRunActive = false
+	m.agentRunCancel = nil
+	m.cancelRequested = false
+	if m.chat != nil {
+		m.chat.ClearActivity()
 	}
 }
 
-type AgentReplyMsg struct {
+func (m *AppModel) runAgentCmd(runCtx context.Context, prompt string) tea.Cmd {
+	return func() tea.Msg {
+		if runCtx == nil {
+			runCtx = context.Background()
+		}
+		if m.orc == nil {
+			return AgentRunResultMsg{
+				Role: "ORCHESTRATOR",
+				Err:  fmt.Errorf("orchestrator is not initialized"),
+			}
+		}
+		if !m.hasPlannerModelSelected() {
+			return AgentRunResultMsg{
+				Role: "ORCHESTRATOR",
+				Err:  fmt.Errorf("planner model is not configured"),
+			}
+		}
+
+		err := m.orc.Run(runCtx, prompt)
+		if agent.IsUserCancelled(err) {
+			err = agent.ErrUserCancelled
+		}
+		return AgentRunResultMsg{
+			Role: "ORCHESTRATOR",
+			Err:  err,
+		}
+	}
+}
+
+type AgentRunResultMsg struct {
 	Reply string
 	Role  string
+	Err   error
 }
 
 func waitForStepUpdate(ch chan agent.StepUpdate) tea.Cmd {
@@ -696,7 +811,7 @@ func (m *AppModel) applySelectedModel(model ModelOption) {
 
 func (m *AppModel) currentRole() string {
 	if len(m.roleOrder) == 0 {
-		return "CODER"
+		return "PLANNER"
 	}
 	if m.activeRole < 0 || m.activeRole >= len(m.roleOrder) {
 		m.activeRole = 0
@@ -739,18 +854,39 @@ func (m *AppModel) syncRoleAndModelDisplay() {
 	}
 	m.syncExecutionModeFromSession()
 
-	role := m.currentRole()
-	m.statusbar.Role = role
-	model := strings.TrimSpace(m.roleModels[role])
-	if model == "" {
-		model = "no-model-selected"
-	}
-	m.statusbar.ModelName = model
 	m.statusbar.ExecutionMode = strings.ToUpper(m.currentExecutionMode())
-
-	for _, roleName := range []string{"CODER", "REVIEWER", "PLANNER"} {
+	for _, roleName := range []string{"PLANNER", "CODER", "REVIEWER"} {
+		if m.isRoleConfigured(roleName) {
+			m.statusbar.SetRoleModel(roleName, strings.TrimSpace(m.roleModels[roleName]))
+			if !m.agentRunActive {
+				m.statusbar.SetRoleState(roleName, "")
+			}
+		} else {
+			m.statusbar.SetRoleModel(roleName, "")
+			m.statusbar.SetRoleState(roleName, "unset")
+		}
 		m.applyRoleConfigToAgent(roleName)
 	}
+	if m.chat != nil {
+		m.chat.SetInputAvailability(true, "")
+	}
+}
+
+func (m *AppModel) openModelRolePicker() {
+	if m.rolesModal == nil {
+		return
+	}
+	m.rolesModal.Title = "Configure Role Model"
+	m.rolesModal.Hint = "up/down: navigate  enter: choose role  esc: close"
+	m.rolesModal.SetOptions([]SelectOption{
+		{Label: "PLANNER", Enabled: true},
+		{Label: "CODER", Enabled: true},
+		{Label: "REVIEWER", Enabled: true},
+	})
+	if m.activeRole >= 0 && m.activeRole < len(m.rolesModal.Options) {
+		m.rolesModal.Selected = m.activeRole
+	}
+	m.rolesModal.Open()
 }
 
 func (m *AppModel) applyRoleConfigToAgent(role string) {
@@ -759,9 +895,8 @@ func (m *AppModel) applyRoleConfigToAgent(role string) {
 		return
 	}
 	a.Model = strings.TrimSpace(m.roleModels[role])
-
 	providerKey := strings.TrimSpace(m.roleProviderKeys[role])
-	if providerKey == "" {
+	if providerKey == "" || !m.isRoleConfigured(role) {
 		a.Provider = nil
 		return
 	}
@@ -829,6 +964,37 @@ func (m *AppModel) isProviderConnected(providerKey string) bool {
 		return true
 	}
 	return len(uniqueSortedModels(m.discoveredModels[providerKey])) > 0
+}
+
+func (m *AppModel) isModelDiscovered(providerKey, modelID string) bool {
+	providerKey = strings.TrimSpace(providerKey)
+	modelID = normalizeSelectedModelID(providerKey, modelID)
+	if providerKey == "" || modelID == "" {
+		return false
+	}
+	models := uniqueSortedModels(m.discoveredModels[providerKey])
+	if len(models) == 0 {
+		return false
+	}
+	for _, model := range models {
+		if normalizeSelectedModelID(providerKey, model) == modelID {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *AppModel) isRoleConfigured(role string) bool {
+	role = strings.ToUpper(strings.TrimSpace(role))
+	modelID := strings.TrimSpace(m.roleModels[role])
+	providerKey := strings.TrimSpace(m.roleProviderKeys[role])
+	if modelID == "" || providerKey == "" {
+		return false
+	}
+	if !m.isProviderConnected(providerKey) {
+		return false
+	}
+	return m.isModelDiscovered(providerKey, modelID)
 }
 
 func (m *AppModel) refreshConnectOptions() {
@@ -902,7 +1068,7 @@ func (m *AppModel) providerInstanceByKey(key string) (providers.Provider, error)
 		discoveryCfg.KeyName = providerEntry.KeyName
 	}
 
-	p, err := providers.NewDiscoveryProvider(discoveryCfg)
+	p, err := newDiscoveryProvider(discoveryCfg)
 	if err != nil {
 		return nil, err
 	}
@@ -937,7 +1103,7 @@ func (m *AppModel) fetchProviderModelsCmd(requestID int, provider ProviderCatalo
 			}
 		}
 
-		p, err := providers.NewDiscoveryProvider(discoveryCfg)
+		p, err := newDiscoveryProvider(discoveryCfg)
 		if err != nil {
 			return ModelsFetchedMsg{
 				RequestID:    requestID,
@@ -968,6 +1134,64 @@ func (m *AppModel) fetchProviderModelsCmd(requestID int, provider ProviderCatalo
 	}
 }
 
+func (m *AppModel) startupProviderRestoreCmds() []tea.Cmd {
+	if m == nil {
+		return nil
+	}
+	cmds := make([]tea.Cmd, 0, len(m.providerCatalog))
+	for _, provider := range m.providerCatalog {
+		credential := strings.TrimSpace(loadProviderCredential(provider.KeyName))
+		if credential == "" {
+			continue
+		}
+		cmds = append(cmds, m.restoreProviderCmd(provider, credential))
+	}
+	return cmds
+}
+
+func (m *AppModel) restoreProviderCmd(provider ProviderCatalog, credential string) tea.Cmd {
+	providerKey := strings.TrimSpace(provider.KeyName)
+	providerName := strings.TrimSpace(provider.Name)
+	discoveryCfg := provider.Discovery
+	if strings.TrimSpace(discoveryCfg.KeyName) == "" {
+		discoveryCfg.KeyName = providerKey
+	}
+	credential = strings.TrimSpace(credential)
+	return func() tea.Msg {
+		if credential == "" {
+			return ProviderRestoreResultMsg{
+				ProviderName: providerName,
+				ProviderKey:  providerKey,
+				Err:          fmt.Errorf("no stored credential"),
+			}
+		}
+		p, err := newDiscoveryProvider(discoveryCfg)
+		if err != nil {
+			return ProviderRestoreResultMsg{
+				ProviderName: providerName,
+				ProviderKey:  providerKey,
+				Err:          err,
+			}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+		defer cancel()
+
+		models, err := providers.DiscoverModels(ctx, p)
+		if err != nil {
+			return ProviderRestoreResultMsg{
+				ProviderName: providerName,
+				ProviderKey:  providerKey,
+				Err:          err,
+			}
+		}
+		return ProviderRestoreResultMsg{
+			ProviderName: providerName,
+			ProviderKey:  providerKey,
+			Models:       models,
+		}
+	}
+}
+
 func (m *AppModel) loadPersistedSessionSelections() {
 	if m.db == nil || m.session == nil {
 		return
@@ -975,6 +1199,15 @@ func (m *AppModel) loadPersistedSessionSelections() {
 	selections, err := m.db.GetSessionModelSelections(context.Background(), m.session.ID)
 	if err != nil {
 		return
+	}
+	if len(selections) == 0 {
+		latest, latestErr := m.db.GetLatestModelSelections(context.Background())
+		if latestErr == nil && len(latest) > 0 {
+			selections = latest
+			for role, selection := range latest {
+				_ = m.db.SaveSessionModelSelection(context.Background(), m.session.ID, role, selection.ProviderKey, selection.ModelID)
+			}
+		}
 	}
 	for role, selection := range selections {
 		role = strings.ToUpper(strings.TrimSpace(role))
@@ -985,12 +1218,177 @@ func (m *AppModel) loadPersistedSessionSelections() {
 		modelID := normalizeSelectedModelID(providerKey, selection.ModelID)
 		m.roleModels[role] = modelID
 		m.roleProviderKeys[role] = providerKey
-		if providerKey != "" && modelID != "" {
-			m.discoveredModels[providerKey] = uniqueSortedModels(
-				append(m.discoveredModels[providerKey], modelID),
-			)
-			m.setProviderConnected(providerKey, true)
+	}
+}
+
+func (m *AppModel) collectMissingCredentialIssues() {
+	if m == nil {
+		return
+	}
+	if m.restoreIssues == nil {
+		m.restoreIssues = make(map[string]string)
+	}
+	for _, role := range []string{"PLANNER", "CODER", "REVIEWER"} {
+		providerKey := strings.ToLower(strings.TrimSpace(m.roleProviderKeys[role]))
+		modelID := strings.TrimSpace(m.roleModels[role])
+		if providerKey == "" || modelID == "" {
+			continue
 		}
+		if strings.TrimSpace(loadProviderCredential(providerKey)) != "" {
+			continue
+		}
+		m.restoreIssues[providerKey] = fmt.Sprintf("%s needs reconnect", m.providerLabel(providerKey))
+	}
+}
+
+func (m *AppModel) providerLabel(providerKey string) string {
+	providerKey = strings.ToLower(strings.TrimSpace(providerKey))
+	for _, provider := range m.providerCatalog {
+		if strings.EqualFold(strings.TrimSpace(provider.KeyName), providerKey) {
+			return strings.TrimSpace(provider.Name)
+		}
+	}
+	if providerKey == "" {
+		return "provider"
+	}
+	return providerKey
+}
+
+func (m *AppModel) updateRestoreHint() {
+	if m == nil || m.statusbar == nil {
+		return
+	}
+	if len(m.restoreIssues) == 0 {
+		m.statusbar.SetHint("")
+		return
+	}
+	parts := make([]string, 0, len(m.restoreIssues))
+	for providerKey := range m.restoreIssues {
+		parts = append(parts, m.providerLabel(providerKey))
+	}
+	sort.Strings(parts)
+	m.statusbar.SetHint("reconnect: " + strings.Join(parts, ", "))
+}
+
+func (m *AppModel) loadPersistedInputHistory() {
+	if m.db == nil || m.session == nil {
+		return
+	}
+	history, err := m.db.GetSessionInputHistory(context.Background(), m.session.ID)
+	if err != nil {
+		return
+	}
+	m.inputHistory = append([]string(nil), history...)
+	if len(m.inputHistory) > state.DefaultInputHistoryLimit {
+		m.inputHistory = m.inputHistory[len(m.inputHistory)-state.DefaultInputHistoryLimit:]
+	}
+}
+
+func (m *AppModel) appendInputHistory(entry string) {
+	entry = strings.TrimSpace(entry)
+	if entry == "" {
+		return
+	}
+	m.inputHistory = append(m.inputHistory, entry)
+	if len(m.inputHistory) > state.DefaultInputHistoryLimit {
+		m.inputHistory = m.inputHistory[len(m.inputHistory)-state.DefaultInputHistoryLimit:]
+	}
+	m.resetInputHistoryNavigation()
+
+	if m.db != nil && m.session != nil {
+		if err := m.db.AppendSessionInputHistory(context.Background(), m.session.ID, entry); err != nil && m.chat != nil {
+			m.chat.AddMessage("System", fmt.Sprintf("warning: failed to persist input history: %v", err))
+		}
+	}
+}
+
+func (m *AppModel) resetInputHistoryNavigation() {
+	m.inputHistoryIndex = len(m.inputHistory)
+	m.inputDraft = ""
+	m.historyBrowsing = false
+}
+
+func (m *AppModel) navigateInputHistory(delta int) bool {
+	if m == nil || m.chat == nil {
+		return false
+	}
+	if len(m.inputHistory) == 0 || delta == 0 {
+		return false
+	}
+
+	if !m.historyBrowsing {
+		m.inputDraft = m.chat.GetInputValue()
+		m.inputHistoryIndex = len(m.inputHistory)
+		m.historyBrowsing = true
+	}
+
+	switch {
+	case delta < 0:
+		if m.inputHistoryIndex > 0 {
+			m.inputHistoryIndex--
+		}
+		m.chat.SetInputValue(m.inputHistory[m.inputHistoryIndex])
+		return true
+	case delta > 0:
+		if m.inputHistoryIndex < len(m.inputHistory)-1 {
+			m.inputHistoryIndex++
+			m.chat.SetInputValue(m.inputHistory[m.inputHistoryIndex])
+			return true
+		}
+		m.inputHistoryIndex = len(m.inputHistory)
+		m.chat.SetInputValue(m.inputDraft)
+		m.historyBrowsing = false
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *AppModel) dispatchUpDownKey(msg tea.KeyMsg) (bool, tea.Cmd) {
+	delta, ok := upDownDelta(msg)
+	if !ok {
+		return false, nil
+	}
+
+	// Modal navigation always has highest priority.
+	if m.modelsModal != nil && m.modelsModal.Visible {
+		return true, m.modelsModal.Update(msg)
+	}
+	if m.rolesModal != nil && m.rolesModal.Visible {
+		m.rolesModal.Move(delta)
+		return true, nil
+	}
+	if m.connectModal != nil && m.connectModal.Visible {
+		m.connectModal.Move(delta)
+		return true, nil
+	}
+	if m.authMethodModal != nil && m.authMethodModal.Visible {
+		m.authMethodModal.Move(delta)
+		return true, nil
+	}
+	if (m.planModal != nil && m.planModal.Visible) || (m.apiKeyModal != nil && m.apiKeyModal.Visible) {
+		return true, nil
+	}
+
+	// Command suggestions win over input history.
+	if m.chat != nil && m.chat.HasVisibleSuggestions() {
+		m.chat.MoveSlashSelection(delta)
+		return true, nil
+	}
+
+	// Lowest priority: input history owns up/down in normal chat mode.
+	m.navigateInputHistory(delta)
+	return true, nil
+}
+
+func upDownDelta(msg tea.KeyMsg) (int, bool) {
+	switch msg.String() {
+	case "up":
+		return -1, true
+	case "down":
+		return 1, true
+	default:
+		return 0, false
 	}
 }
 
@@ -1017,6 +1415,10 @@ func (m *AppModel) hasAnyModelSelected() bool {
 		}
 	}
 	return false
+}
+
+func (m *AppModel) hasPlannerModelSelected() bool {
+	return m.isRoleConfigured("PLANNER")
 }
 
 func (m *AppModel) hasAllOrchestratorModelsSelected() bool {
@@ -1068,6 +1470,21 @@ func (m *AppModel) handleAgentEvent(event agent.AgentEvent) {
 	if m == nil || m.chat == nil {
 		return
 	}
+	m.updateActivityLine(event)
+	if m.statusbar != nil {
+		roleName := strings.ToUpper(strings.TrimSpace(string(event.Role)))
+		if roleName != "" {
+			m.statusbar.SetRoleState(roleName, statusStateForEvent(event.Type))
+		}
+	}
+
+	if event.Type == agent.EventFileDiff {
+		if diff, ok := extractFileDiffPayload(event.Payload); ok {
+			m.chat.AddFileDiff(diff.Path, diff.OldLines, diff.NewLines)
+			return
+		}
+	}
+
 	roleLabel := formatAgentRoleLabel(event.Role)
 	detail := strings.TrimSpace(event.Detail)
 	if detail == "" {
@@ -1166,6 +1583,181 @@ func renderAgentEventLine(roleLabel string, eventType agent.AgentEventType, deta
 	}
 }
 
+func statusStateForEvent(eventType agent.AgentEventType) string {
+	switch eventType {
+	case agent.EventThinking:
+		return "thinking"
+	case agent.EventPlanning:
+		return "planning"
+	case agent.EventReading:
+		return "reading"
+	case agent.EventWriting:
+		return "writing"
+	case agent.EventFileDiff:
+		return "writing"
+	case agent.EventRunning:
+		return "running"
+	case agent.EventReviewing:
+		return "reviewing"
+	case agent.EventWaiting:
+		return "waiting"
+	case agent.EventDone:
+		return "idle"
+	case agent.EventError:
+		return "error"
+	default:
+		return "working"
+	}
+}
+
+func (m *AppModel) updateActivityLine(event agent.AgentEvent) {
+	if m == nil || m.chat == nil {
+		return
+	}
+	phase, action, target, key, ok := mapEventToActivity(event)
+	if !ok {
+		return
+	}
+	if isInternalOrchestraPath(target) || isInternalOrchestraPath(strings.TrimSpace(event.Detail)) {
+		return
+	}
+	m.chat.SetActivity(phase, action, target, key)
+}
+
+func mapEventToActivity(event agent.AgentEvent) (phase, action, target, key string, ok bool) {
+	role := strings.ToUpper(strings.TrimSpace(string(event.Role)))
+	if role == "" {
+		role = "AGENT"
+	}
+	detail := strings.TrimSpace(event.Detail)
+	switch event.Type {
+	case agent.EventPlanning:
+		phase = "Planning"
+		action = "runTask"
+		target = detail
+	case agent.EventThinking:
+		phase = "Thinking"
+		action = "reasoning"
+		target = detail
+	case agent.EventReading:
+		phase = "Executing"
+		action = "readFile"
+		target = eventTargetFromPayload(event, "path", detail)
+	case agent.EventWriting:
+		phase = "Executing"
+		action = "writeFile"
+		target = eventTargetFromPayload(event, "path", detail)
+	case agent.EventRunning:
+		phase = "Executing"
+		action = "runTask"
+		target = detail
+		if command, ok := eventPayloadString(event.Payload, "command"); ok {
+			action = "runCommand"
+			target = command
+		}
+	case agent.EventReviewing:
+		phase = "Reviewing"
+		action = "runReview"
+		target = detail
+	case agent.EventWaiting:
+		phase = "Waiting"
+		action = "awaitingInput"
+		target = detail
+	case agent.EventFileDiff:
+		phase = "Executing"
+		action = "writeFile"
+		target = eventTargetFromPayload(event, "path", detail)
+	default:
+		return "", "", "", "", false
+	}
+	phase = strings.TrimSpace(phase)
+	action = strings.TrimSpace(action)
+	target = strings.TrimSpace(target)
+	key = fmt.Sprintf("%s|%s|%s|%s", role, phase, action, target)
+	return phase, action, target, key, true
+}
+
+func eventTargetFromPayload(event agent.AgentEvent, payloadKey, fallback string) string {
+	if value, ok := eventPayloadString(event.Payload, payloadKey); ok {
+		return value
+	}
+	fallback = strings.TrimSpace(fallback)
+	if fallback == "" {
+		return ""
+	}
+	parts := strings.Fields(fallback)
+	if len(parts) > 1 {
+		return strings.Join(parts[1:], " ")
+	}
+	return fallback
+}
+
+func eventPayloadString(payload any, key string) (string, bool) {
+	values, ok := payload.(map[string]any)
+	if !ok || values == nil {
+		return "", false
+	}
+	raw, ok := values[key]
+	if !ok {
+		return "", false
+	}
+	value, ok := raw.(string)
+	if !ok {
+		return "", false
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", false
+	}
+	return value, true
+}
+
+func extractFileDiffPayload(payload any) (agent.FileDiffPayload, bool) {
+	switch typed := payload.(type) {
+	case agent.FileDiffPayload:
+		if strings.TrimSpace(typed.Path) == "" {
+			return agent.FileDiffPayload{}, false
+		}
+		return typed, true
+	case *agent.FileDiffPayload:
+		if typed == nil || strings.TrimSpace(typed.Path) == "" {
+			return agent.FileDiffPayload{}, false
+		}
+		return *typed, true
+	case map[string]any:
+		path, _ := typed["path"].(string)
+		if strings.TrimSpace(path) == "" {
+			return agent.FileDiffPayload{}, false
+		}
+		oldLines := anySliceToStringSlice(typed["old_lines"])
+		newLines := anySliceToStringSlice(typed["new_lines"])
+		return agent.FileDiffPayload{
+			Path:     strings.TrimSpace(path),
+			OldLines: oldLines,
+			NewLines: newLines,
+		}, true
+	default:
+		return agent.FileDiffPayload{}, false
+	}
+}
+
+func anySliceToStringSlice(value any) []string {
+	switch typed := value.(type) {
+	case []string:
+		return append([]string(nil), typed...)
+	case []any:
+		out := make([]string, 0, len(typed))
+		for _, item := range typed {
+			if s, ok := item.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
 func thinkingStreamKey(role agent.Role) string {
 	return "thinking:" + strings.ToLower(strings.TrimSpace(string(role)))
 }
@@ -1218,6 +1810,53 @@ func extractAgentReply(payload any) (string, bool) {
 	return reply, true
 }
 
+func detectRepoPath(session *state.Session) string {
+	if cwd, err := os.Getwd(); err == nil {
+		cwd = strings.TrimSpace(cwd)
+		if cwd != "" {
+			if abs, absErr := filepath.Abs(cwd); absErr == nil {
+				return abs
+			}
+			return cwd
+		}
+	}
+	if session != nil {
+		workingDir := strings.TrimSpace(session.WorkingDir)
+		if workingDir != "" {
+			if abs, err := filepath.Abs(workingDir); err == nil {
+				return abs
+			}
+			return workingDir
+		}
+	}
+	return "."
+}
+
+func displayRepoPath(absPath string) string {
+	absPath = strings.TrimSpace(absPath)
+	if absPath == "" {
+		return "."
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return absPath
+	}
+	home = strings.TrimSpace(home)
+	if home == "" {
+		return absPath
+	}
+	home = filepath.Clean(home)
+	path := filepath.Clean(absPath)
+	if path == home {
+		return "~"
+	}
+	prefix := home + string(filepath.Separator)
+	if strings.HasPrefix(path, prefix) {
+		return "~" + string(filepath.Separator) + strings.TrimPrefix(path, prefix)
+	}
+	return absPath
+}
+
 func normalizeSelectedModelID(providerKey, modelID string) string {
 	modelID = strings.TrimSpace(modelID)
 	if strings.EqualFold(strings.TrimSpace(providerKey), "openrouter") {
@@ -1227,6 +1866,31 @@ func normalizeSelectedModelID(providerKey, modelID string) string {
 		}
 	}
 	return strings.TrimSpace(modelID)
+}
+
+func classifyUserInput(raw string) (trimmed string, isCommand bool) {
+	trimmed = strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", false
+	}
+	return trimmed, strings.HasPrefix(trimmed, "/")
+}
+
+func shouldResetHistoryNavigation(msg tea.KeyMsg) bool {
+	switch msg.String() {
+	case "up", "down", "enter":
+		return false
+	}
+	switch msg.Type {
+	case tea.KeyRunes, tea.KeyBackspace, tea.KeyDelete:
+		return true
+	default:
+		return false
+	}
+}
+
+func isInternalOrchestraPath(text string) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(text)), ".orchestra/")
 }
 
 // expandFileReferences scans input for @path/to/file patterns, reads the

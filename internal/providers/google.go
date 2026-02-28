@@ -9,8 +9,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-
-	"github.com/zalando/go-keyring"
 )
 
 type Google struct {
@@ -26,9 +24,9 @@ func (p *Google) Name() string {
 }
 
 func (p *Google) getKey() (string, error) {
-	key, err := keyring.Get("orchestra", "google")
-	if err != nil || key == "" {
-		return "", &ProviderAuthError{ProviderName: "google", Msg: "API key not found in keyring"}
+	key, err := LoadCredential("google")
+	if err != nil || strings.TrimSpace(key) == "" {
+		return "", &ProviderAuthError{ProviderName: "google", Msg: "API key not found. Run /connect to reconnect provider."}
 	}
 	return key, nil
 }

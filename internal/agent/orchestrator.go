@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -52,7 +53,6 @@ type ExecutionStrategy int
 const (
 	StrategyFull ExecutionStrategy = iota
 	StrategyNoCoder
-	StrategyNoPlanner
 	StrategyNoReviewer
 	StrategySolo
 )
@@ -84,6 +84,7 @@ type Orchestrator struct {
 	PlanApprovalChan chan PlanApproval
 	WorkingDir       string
 	ProjectBrief     string
+	writePlanLockFn  func(context.Context, string) error
 }
 
 var ErrOrchestratorNotReady = errors.New("orchestrator is not initialized")
@@ -92,11 +93,17 @@ func (o *Orchestrator) emit(update StepUpdate) {
 	if o == nil || o.UpdateChan == nil {
 		return
 	}
+	if shouldSuppressInternalUpdate(update) {
+		return
+	}
 	o.UpdateChan <- update
 }
 
 func (o *Orchestrator) emitEvent(event AgentEvent) {
 	if o == nil || o.EventChan == nil {
+		return
+	}
+	if shouldSuppressInternalEvent(event) {
 		return
 	}
 	if event.At.IsZero() {
@@ -109,6 +116,9 @@ func (o *Orchestrator) Run(ctx context.Context, prompt string) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := checkContextCancelled(ctx); err != nil {
+		return err
+	}
 	prompt = strings.TrimSpace(prompt)
 	if prompt == "" {
 		err := errors.New("prompt is empty")
@@ -119,45 +129,72 @@ func (o *Orchestrator) Run(ctx context.Context, prompt string) error {
 		return ErrOrchestratorNotReady
 	}
 
-	o.bindAgentToolSets()
-	if !isTaskMessage(prompt) {
-		return o.runConversational(ctx, prompt)
-	}
 	availability := o.collectAvailability(ctx)
+	if err := checkContextCancelled(ctx); err != nil {
+		return err
+	}
 	strategy, err := deriveStrategy(availability)
 	if err != nil {
 		o.emit(StepUpdate{StepID: "orchestrator", Status: "failed", Msg: err.Error()})
 		o.emitEvent(AgentEvent{Type: EventError, Role: RolePlanner, Detail: err.Error()})
 		return err
 	}
+	o.bindAgentToolSets(strategy)
 
+	execMode := o.executionMode()
 	projectBrief := o.ensureProjectBrief()
-	o.emitEvent(AgentEvent{Type: EventPlanning, Role: RolePlanner, Detail: fmt.Sprintf("strategy=%s mode=%s", strategyName(strategy), o.executionMode())})
+	if execMode == state.ExecutionModePlan {
+		o.emitEvent(AgentEvent{Type: EventPlanning, Role: RolePlanner, Detail: fmt.Sprintf("strategy=%s mode=%s", strategyName(strategy), execMode)})
+	} else {
+		o.emitEvent(AgentEvent{Type: EventRunning, Role: executionRoleForStrategy(strategy), Detail: fmt.Sprintf("strategy=%s mode=%s", strategyName(strategy), execMode)})
+	}
 	o.emit(StepUpdate{
 		StepID:   "orchestrator",
 		Status:   "running",
-		Msg:      fmt.Sprintf("Strategy: %s | mode: %s", strategyName(strategy), o.executionMode()),
+		Msg:      fmt.Sprintf("Strategy: %s | mode: %s", strategyName(strategy), execMode),
 		PlanYAML: "",
 	})
-
-	planYAML, plan, err := o.buildPlan(ctx, prompt, projectBrief, strategy, availability)
-	if err != nil {
-		o.emit(StepUpdate{StepID: "planner", Status: "failed", Msg: err.Error()})
-		o.emitEvent(AgentEvent{Type: EventError, Role: RolePlanner, Detail: err.Error()})
-		return err
+	if !isTaskMessage(prompt) {
+		return o.runConversational(ctx, prompt, strategy)
 	}
-	planID := o.newPlanID()
-	planPath, err := o.persistPlanMarkdown(ctx, planID, prompt, plan, planYAML)
-	if err != nil {
-		o.emit(StepUpdate{StepID: "planner", Status: "failed", Msg: err.Error()})
-		o.emitEvent(AgentEvent{Type: EventError, Role: RolePlanner, Detail: err.Error()})
-		return err
-	}
-	o.emit(StepUpdate{StepID: "planner", Status: "done", Msg: fmt.Sprintf("Plan saved to %s", planPath)})
 
-	if o.executionMode() == state.ExecutionModePlan {
+	var (
+		planYAML string
+		plan     YAMLPlan
+	)
+	planID := ""
+	planPath := ""
+	if execMode == state.ExecutionModePlan {
+		planYAML, plan, err = o.buildPlan(ctx, prompt, projectBrief, availability)
+		if err != nil {
+			err = normalizeCancellationErr(err)
+			if IsUserCancelled(err) {
+				return err
+			}
+			o.emit(StepUpdate{StepID: "planner", Status: "failed", Msg: err.Error()})
+			o.emitEvent(AgentEvent{Type: EventError, Role: RolePlanner, Detail: err.Error()})
+			return err
+		}
+
+		planID = o.newPlanID()
+		planPath, err = o.persistPlanMarkdown(ctx, planID, prompt, plan, planYAML)
+		if err != nil {
+			err = normalizeCancellationErr(err)
+			if IsUserCancelled(err) {
+				return err
+			}
+			o.emit(StepUpdate{StepID: "planner", Status: "failed", Msg: err.Error()})
+			o.emitEvent(AgentEvent{Type: EventError, Role: RolePlanner, Detail: err.Error()})
+			return err
+		}
+		o.emit(StepUpdate{StepID: "planner", Status: "done", Msg: fmt.Sprintf("Plan saved to %s", planPath)})
+
 		approvedPlanYAML, err := o.waitForPlanApproval(ctx, planID, planYAML)
 		if err != nil {
+			err = normalizeCancellationErr(err)
+			if IsUserCancelled(err) {
+				return err
+			}
 			o.emit(StepUpdate{StepID: "planner", Status: "failed", Msg: err.Error()})
 			o.emitEvent(AgentEvent{Type: EventError, Role: RolePlanner, Detail: err.Error()})
 			return err
@@ -173,48 +210,67 @@ func (o *Orchestrator) Run(ctx context.Context, prompt string) error {
 			planYAML = approvedPlanYAML
 			planPath, err = o.persistPlanMarkdown(ctx, planID, prompt, plan, planYAML)
 			if err != nil {
+				err = normalizeCancellationErr(err)
+				if IsUserCancelled(err) {
+					return err
+				}
 				o.emit(StepUpdate{StepID: "planner", Status: "failed", Msg: err.Error()})
 				o.emitEvent(AgentEvent{Type: EventError, Role: RolePlanner, Detail: err.Error()})
 				return err
 			}
 			o.emit(StepUpdate{StepID: "planner", Status: "done", Msg: "Edited plan approved"})
 		}
-	}
-
-	if strategy == StrategyNoCoder {
-		if err := o.runAnalysisOnly(ctx, prompt, projectBrief, planYAML, availability); err != nil {
-			o.emit(StepUpdate{StepID: "analysis", Status: "failed", Msg: err.Error()})
-			o.emitEvent(AgentEvent{Type: EventError, Role: RoleAnalyst, Detail: err.Error()})
-			return err
+	} else {
+		plan = fallbackPlan(prompt)
+		planYAML = renderPlanYAML(plan)
+		directMsg := "FAST mode active: dispatching prompt directly to executor (planner planning skipped)"
+		if strategy == StrategyNoCoder || strategy == StrategySolo {
+			directMsg = "FAST mode active: coder unavailable, planner executes prompt directly"
 		}
-		o.emit(StepUpdate{StepID: "orchestrator", Status: "done", Msg: "Analysis complete"})
-		o.emitEvent(AgentEvent{Type: EventDone, Role: RoleAnalyst, Detail: "analysis complete"})
-		return nil
+		o.emit(StepUpdate{
+			StepID: "orchestrator",
+			Status: "running",
+			Msg:    directMsg,
+		})
 	}
 
-	executor := o.selectExecutor(availability)
+	executor := o.selectExecutor(strategy)
 	if executor == nil {
 		err := errors.New("no execution agent available")
 		o.emit(StepUpdate{StepID: "orchestrator", Status: "failed", Msg: err.Error()})
-		o.emitEvent(AgentEvent{Type: EventError, Role: RoleCoder, Detail: err.Error()})
+		o.emitEvent(AgentEvent{Type: EventError, Role: executionRoleForStrategy(strategy), Detail: err.Error()})
 		return err
 	}
-	reviewer := o.selectReviewer(availability, executor)
+	reviewer := o.selectReviewer(strategy, executor)
 
 	if err := o.executePlan(ctx, prompt, projectBrief, plan, planPath, strategy, executor, reviewer); err != nil {
+		err = normalizeCancellationErr(err)
+		if IsUserCancelled(err) {
+			return err
+		}
 		o.emit(StepUpdate{StepID: "orchestrator", Status: "failed", Msg: err.Error()})
-		o.emitEvent(AgentEvent{Type: EventError, Role: RoleCoder, Detail: err.Error()})
+		o.emitEvent(AgentEvent{Type: EventError, Role: executor.Role, Detail: err.Error()})
 		return err
 	}
-	if err := o.writePlanLock(ctx, planID); err != nil {
-		o.emit(StepUpdate{StepID: "planner", Status: "failed", Msg: err.Error()})
-		o.emitEvent(AgentEvent{Type: EventError, Role: RolePlanner, Detail: err.Error()})
-		return err
-	}
-
 	o.emit(StepUpdate{StepID: "orchestrator", Status: "done", Msg: "All tasks completed"})
-	o.emitEvent(AgentEvent{Type: EventDone, Role: RoleCoder, Detail: "all tasks completed"})
+	doneRole := RolePlanner
+	if executor != nil {
+		doneRole = executor.Role
+	}
+	o.emitEvent(AgentEvent{Type: EventDone, Role: doneRole, Detail: "all tasks completed"})
+	if execMode == state.ExecutionModePlan {
+		o.schedulePlanLockWrite(planID)
+	}
 	return nil
+}
+
+func executionRoleForStrategy(strategy ExecutionStrategy) Role {
+	switch strategy {
+	case StrategyNoCoder, StrategySolo:
+		return RolePlanner
+	default:
+		return RoleCoder
+	}
 }
 
 func (o *Orchestrator) SubmitPlanApproval(decision PlanApproval) {
@@ -283,48 +339,49 @@ func (o *Orchestrator) agentReady(ctx context.Context, a *Agent) bool {
 }
 
 func deriveStrategy(av roleAvailability) (ExecutionStrategy, error) {
+	if !av.planner {
+		return StrategySolo, errors.New("planner model is required; run /models and assign Planner before starting")
+	}
 	if av.planner && av.coder && av.reviewer {
 		return StrategyFull, nil
 	}
 	if av.planner && !av.coder && av.reviewer {
 		return StrategyNoCoder, nil
 	}
-	if !av.planner && av.coder && av.reviewer {
-		return StrategyNoPlanner, nil
-	}
 	if av.planner && av.coder && !av.reviewer {
 		return StrategyNoReviewer, nil
 	}
-	if av.any() {
-		return StrategySolo, nil
-	}
-	return StrategySolo, errors.New("no available agents; configure at least one working role")
+	return StrategySolo, nil
 }
 
 func strategyName(s ExecutionStrategy) string {
 	switch s {
 	case StrategyFull:
-		return "full"
+		return "planner+coder+reviewer"
 	case StrategyNoCoder:
-		return "no-coder"
-	case StrategyNoPlanner:
-		return "no-planner"
+		return "planner+reviewer (planner codes)"
 	case StrategyNoReviewer:
-		return "no-reviewer"
+		return "planner+coder (no reviewer gate)"
 	case StrategySolo:
-		return "solo"
+		return "planner-solo"
 	default:
 		return "unknown"
 	}
 }
 
-func (o *Orchestrator) buildPlan(ctx context.Context, prompt, projectBrief string, strategy ExecutionStrategy, availability roleAvailability) (string, YAMLPlan, error) {
-	if availability.planner && o.Planner != nil && strategy != StrategyNoPlanner {
+func (o *Orchestrator) buildPlan(ctx context.Context, prompt, projectBrief string, availability roleAvailability) (string, YAMLPlan, error) {
+	if err := checkContextCancelled(ctx); err != nil {
+		return "", YAMLPlan{}, err
+	}
+	if availability.planner && o.Planner != nil {
 		var planYAML string
 		var parsed YAMLPlan
 		var planErr error
 
 		for attempt := 1; attempt <= 3; attempt++ {
+			if err := checkContextCancelled(ctx); err != nil {
+				return "", YAMLPlan{}, err
+			}
 			o.emit(StepUpdate{StepID: "planner", Status: "running", Msg: fmt.Sprintf("Generating plan (attempt %d/3)", attempt)})
 			o.emitEvent(AgentEvent{
 				Type:   EventThinking,
@@ -337,6 +394,10 @@ func (o *Orchestrator) buildPlan(ctx context.Context, prompt, projectBrief strin
 				OnToken: o.streamTokenCallback(RolePlanner),
 			})
 			if planErr != nil {
+				planErr = normalizeCancellationErr(planErr)
+				if IsUserCancelled(planErr) {
+					return "", YAMLPlan{}, planErr
+				}
 				continue
 			}
 
@@ -352,12 +413,7 @@ func (o *Orchestrator) buildPlan(ctx context.Context, prompt, projectBrief strin
 		}
 		return "", YAMLPlan{}, fmt.Errorf("planner failed: %w", planErr)
 	}
-
-	fallback := fallbackPlan(prompt)
-	fallbackYAML := renderPlanYAML(fallback)
-	o.emit(StepUpdate{StepID: "planner", Status: "done", Msg: "Planner unavailable; using fallback single-task plan"})
-	o.emitEvent(AgentEvent{Type: EventDone, Role: RolePlanner, Detail: "planner unavailable; using fallback plan"})
-	return fallbackYAML, fallback, nil
+	return "", YAMLPlan{}, errors.New("planner is unavailable; assign a planner model before running tasks")
 }
 
 func (o *Orchestrator) waitForPlanApproval(ctx context.Context, planID, planYAML string) (string, error) {
@@ -390,7 +446,7 @@ func (o *Orchestrator) waitForPlanApproval(ctx context.Context, planID, planYAML
 	for {
 		select {
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return "", normalizeCancellationErr(ctx.Err())
 		case decision := <-o.PlanApprovalChan:
 			if strings.TrimSpace(decision.PlanID) != planID {
 				continue
@@ -411,6 +467,9 @@ func (o *Orchestrator) waitForPlanApproval(ctx context.Context, planID, planYAML
 }
 
 func (o *Orchestrator) runAnalysisOnly(ctx context.Context, prompt, projectBrief, planYAML string, availability roleAvailability) error {
+	if err := checkContextCancelled(ctx); err != nil {
+		return err
+	}
 	analyst := o.Planner
 	if analyst == nil || !availability.planner {
 		analyst = o.Reviewer
@@ -438,48 +497,63 @@ There is no coder available. Provide a concise implementation strategy, risks, a
 		OnToken: o.streamTokenCallback(analyst.Role),
 	})
 	if err != nil {
-		return err
+		return normalizeCancellationErr(err)
 	}
 	o.emit(StepUpdate{StepID: "analysis", Status: "done", Msg: "Analysis completed"})
 	o.emitEvent(AgentEvent{Type: EventDone, Role: analyst.Role, Detail: "analysis completed"})
 	return nil
 }
 
-func (o *Orchestrator) selectExecutor(availability roleAvailability) *Agent {
-	if availability.coder && o.Coder != nil {
-		return o.Coder
+func (o *Orchestrator) selectExecutor(strategy ExecutionStrategy) *Agent {
+	switch strategy {
+	case StrategyFull, StrategyNoReviewer:
+		if o.Coder != nil {
+			return o.Coder
+		}
+	case StrategyNoCoder, StrategySolo:
+		if o.Planner != nil {
+			return o.Planner
+		}
 	}
-	if availability.planner && o.Planner != nil {
+	if o.Planner != nil {
 		return o.Planner
 	}
-	if availability.reviewer && o.Reviewer != nil {
-		return o.Reviewer
+	if o.Coder != nil {
+		return o.Coder
 	}
 	return nil
 }
 
-func (o *Orchestrator) selectReviewer(availability roleAvailability, executor *Agent) *Agent {
-	if !availability.reviewer || o.Reviewer == nil {
-		return nil
-	}
-	if executor == nil {
+func (o *Orchestrator) selectReviewer(strategy ExecutionStrategy, executor *Agent) *Agent {
+	switch strategy {
+	case StrategyFull, StrategyNoCoder:
+		if o.Reviewer == nil || o.Reviewer == executor {
+			return nil
+		}
 		return o.Reviewer
-	}
-	if executor == o.Reviewer {
+	default:
 		return nil
 	}
-	return o.Reviewer
 }
 
 func (o *Orchestrator) executePlan(ctx context.Context, prompt, projectBrief string, plan YAMLPlan, planPath string, strategy ExecutionStrategy, executor, reviewer *Agent) error {
+	if err := checkContextCancelled(ctx); err != nil {
+		return err
+	}
 	if len(plan.Tasks) == 0 {
 		return errors.New("execution plan has no tasks")
 	}
 
 	completed := make(map[string]bool, len(plan.Tasks))
 	for len(completed) < len(plan.Tasks) {
+		if err := checkContextCancelled(ctx); err != nil {
+			return err
+		}
 		progress := false
 		for _, task := range plan.Tasks {
+			if err := checkContextCancelled(ctx); err != nil {
+				return err
+			}
 			if completed[task.ID] {
 				continue
 			}
@@ -500,11 +574,15 @@ func (o *Orchestrator) executePlan(ctx context.Context, prompt, projectBrief str
 }
 
 func (o *Orchestrator) runTask(ctx context.Context, prompt, projectBrief string, task PlanTask, planPath string, strategy ExecutionStrategy, executor, reviewer *Agent) error {
+	if err := checkContextCancelled(ctx); err != nil {
+		return err
+	}
 	if executor == nil {
 		return errors.New("no executor agent available")
 	}
 
-	basePrompt := o.buildTaskPrompt(projectBrief, prompt, task, strategy, "")
+	execMode := o.executionMode()
+	basePrompt := o.buildTaskPrompt(projectBrief, prompt, task, planPath, strategy, "", executor.Role, execMode)
 	o.emit(StepUpdate{StepID: task.ID, Status: "running", Msg: "Executing task"})
 	o.emitEvent(AgentEvent{
 		Type:   EventRunning,
@@ -517,11 +595,19 @@ func (o *Orchestrator) runTask(ctx context.Context, prompt, projectBrief string,
 	if rolePrompt == "" {
 		rolePrompt = "CODER"
 	}
-	fileContext := o.buildTaskFileContext(ctx, executor, task)
+	mustReadPlanFile := shouldRequirePlanFileRead(execMode, executor.Role, planPath)
+	fileContext := ""
+	if !mustReadPlanFile {
+		fileContext = o.buildTaskFileContext(ctx, executor, task)
+	}
 	if fileContext != "" {
 		taskPrompt = strings.TrimSpace(taskPrompt + "\n\nRelevant file contents:\n" + fileContext)
 	}
 	for attempt := 1; attempt <= 3; attempt++ {
+		if err := checkContextCancelled(ctx); err != nil {
+			return err
+		}
+		planFileRead := !mustReadPlanFile
 		o.emitEvent(AgentEvent{
 			Type:   EventThinking,
 			Role:   executor.Role,
@@ -530,12 +616,102 @@ func (o *Orchestrator) runTask(ctx context.Context, prompt, projectBrief string,
 		coderOut, err := executor.RunWithOptions(ctx, taskPrompt, o.Session, o.DB, RunOptions{
 			Mode:    DispatchModeTask,
 			OnToken: o.streamTokenCallback(executor.Role),
+			OnToolCall: func(name string, params map[string]any, _ ToolResult, toolErr error) {
+				if planFileRead || !mustReadPlanFile || toolErr != nil {
+					return
+				}
+				if !strings.EqualFold(strings.TrimSpace(name), "read_file") {
+					return
+				}
+				if toolCallPathMatchesPlan(params, planPath) {
+					planFileRead = true
+				}
+			},
 		})
 		if err != nil {
+			err = normalizeCancellationErr(err)
+			if IsUserCancelled(err) {
+				return err
+			}
 			if attempt == 3 {
 				o.emit(StepUpdate{StepID: task.ID, Status: "blocked", Msg: "Executor failed after retries"})
 				o.emitEvent(AgentEvent{Type: EventError, Role: executor.Role, Detail: fmt.Sprintf("execution failed for %s", task.ID)})
 				return err
+			}
+			continue
+		}
+		if mustReadPlanFile && !planFileRead {
+			planPath = strings.TrimSpace(planPath)
+			o.emit(StepUpdate{
+				StepID: task.ID,
+				Status: "running",
+				Msg:    "Coder did not read the plan file. Retrying with explicit read_file enforcement.",
+			})
+			o.emitEvent(AgentEvent{
+				Type:   EventWaiting,
+				Role:   executor.Role,
+				Detail: fmt.Sprintf("retrying %s; plan file %s was not read via tool call", task.ID, planPath),
+			})
+			if attempt == 3 {
+				err := fmt.Errorf("task %s failed: coder did not call read_file on plan file %s", task.ID, planPath)
+				o.emit(StepUpdate{
+					StepID: task.ID,
+					Status: "blocked",
+					Msg:    "Coder must read the approved plan file with read_file before execution.",
+				})
+				o.emitEvent(AgentEvent{Type: EventError, Role: executor.Role, Detail: err.Error()})
+				return err
+			}
+			taskPrompt = strings.TrimSpace(taskPrompt +
+				"\n\nEnforcement:\n- Call read_file with path " + planPath + " before making any edits.\n- Use that file as the source of truth.\n- Do not proceed from memory.")
+			continue
+		}
+
+		missingFiles, verifyErr := o.verifyCreatedFiles(task.FilesToCreate)
+		if verifyErr != nil {
+			if attempt == 3 {
+				o.emit(StepUpdate{StepID: task.ID, Status: "blocked", Msg: "Task verification failed after retries"})
+				o.emitEvent(AgentEvent{Type: EventError, Role: executor.Role, Detail: fmt.Sprintf("verification failed for %s", task.ID)})
+				return verifyErr
+			}
+			taskPrompt = strings.TrimSpace(taskPrompt + "\n\nVerification failed due to an environment error:\n" + verifyErr.Error() + "\nRetry the task and ensure required file writes are executed via tools.")
+			continue
+		}
+		if len(missingFiles) > 0 {
+			missingList := strings.Join(missingFiles, ", ")
+			o.emit(StepUpdate{
+				StepID: task.ID,
+				Status: "running",
+				Msg:    fmt.Sprintf("Verification failed: expected file(s) missing on disk: %s. Retrying with tool-call guidance.", missingList),
+			})
+			o.emitEvent(AgentEvent{
+				Type:   EventWaiting,
+				Role:   executor.Role,
+				Detail: fmt.Sprintf("retrying %s after missing file verification: %s", task.ID, missingList),
+			})
+			if attempt == 3 {
+				err := fmt.Errorf("task %s failed verification: expected file(s) missing on disk after retries: %s", task.ID, missingList)
+				o.emit(StepUpdate{
+					StepID: task.ID,
+					Status: "blocked",
+					Msg:    "Required file(s) were never created. Model must call write_file tool, not only describe changes.",
+				})
+				o.emitEvent(AgentEvent{Type: EventError, Role: executor.Role, Detail: err.Error()})
+				return err
+			}
+
+			retryPrompt := []string{
+				taskPrompt,
+				"",
+				"Verification failure:",
+				"- The following required file(s) are missing on disk: " + missingList,
+				"- You must call the write_file tool to create them.",
+				"- Do not only describe or claim the change.",
+				"- After calling write_file, continue until all required files exist.",
+			}
+			taskPrompt = strings.TrimSpace(strings.Join(retryPrompt, "\n"))
+			if fileContext != "" {
+				taskPrompt = strings.TrimSpace(taskPrompt + "\n\nRelevant file contents:\n" + fileContext)
 			}
 			continue
 		}
@@ -566,6 +742,10 @@ func (o *Orchestrator) runTask(ctx context.Context, prompt, projectBrief string,
 			OnToken: o.streamTokenCallback(reviewer.Role),
 		})
 		if err != nil {
+			err = normalizeCancellationErr(err)
+			if IsUserCancelled(err) {
+				return err
+			}
 			if attempt == 3 {
 				o.emit(StepUpdate{StepID: task.ID, Status: "blocked", Msg: "Reviewer failed after retries"})
 				o.emitEvent(AgentEvent{Type: EventError, Role: reviewer.Role, Detail: fmt.Sprintf("review failed for %s", task.ID)})
@@ -584,7 +764,7 @@ func (o *Orchestrator) runTask(ctx context.Context, prompt, projectBrief string,
 			return nil
 		}
 
-		taskPrompt = o.buildTaskPrompt(projectBrief, prompt, task, strategy, findings)
+		taskPrompt = o.buildTaskPrompt(projectBrief, prompt, task, planPath, strategy, findings, executor.Role, execMode)
 		if fileContext != "" {
 			taskPrompt = strings.TrimSpace(taskPrompt + "\n\nRelevant file contents:\n" + fileContext)
 		}
@@ -618,10 +798,16 @@ tasks:
 `, projectBrief, prompt))
 }
 
-func (o *Orchestrator) buildTaskPrompt(projectBrief, prompt string, task PlanTask, strategy ExecutionStrategy, reviewerFindings string) string {
+func (o *Orchestrator) buildTaskPrompt(projectBrief, prompt string, task PlanTask, planPath string, strategy ExecutionStrategy, reviewerFindings string, executorRole Role, executionMode string) string {
 	var specialInstruction string
-	if strategy == StrategyNoPlanner || strategy == StrategySolo {
-		specialInstruction = "You have no Planner teammate. Think step by step, state your plan briefly, then implement."
+	if strategy == StrategySolo {
+		specialInstruction = "You are operating solo. Plan, implement, and self-review before finalizing."
+	}
+	if strategy == StrategyNoCoder {
+		if specialInstruction != "" {
+			specialInstruction += " "
+		}
+		specialInstruction += "Coder is unassigned for this session. You must implement this task yourself."
 	}
 	if strategy == StrategyNoReviewer {
 		if specialInstruction != "" {
@@ -633,6 +819,25 @@ func (o *Orchestrator) buildTaskPrompt(projectBrief, prompt string, task PlanTas
 	var feedbackBlock string
 	if strings.TrimSpace(reviewerFindings) != "" {
 		feedbackBlock = "\nReviewer feedback to address before completing:\n" + reviewerFindings + "\n"
+	}
+
+	if shouldRequirePlanFileRead(executionMode, executorRole, planPath) {
+		return strings.TrimSpace(fmt.Sprintf(`
+Project context:
+%s
+
+User request:
+%s
+
+Task ID: %s
+Authoritative plan file: %s
+
+You must call the read_file tool with the exact plan file path above before making any edits.
+Use the plan file as the source of truth for this task's scope, files, and acceptance criteria.
+
+%s
+%s
+`, projectBrief, prompt, task.ID, strings.TrimSpace(planPath), specialInstruction, feedbackBlock))
 	}
 
 	return strings.TrimSpace(fmt.Sprintf(`
@@ -651,6 +856,36 @@ Depends on: %s
 %s
 %s
 `, projectBrief, prompt, task.ID, task.Description, strings.Join(task.FilesToModify, ", "), strings.Join(task.FilesToCreate, ", "), strings.Join(task.DependsOn, ", "), specialInstruction, feedbackBlock))
+}
+
+func shouldRequirePlanFileRead(executionMode string, executorRole Role, planPath string) bool {
+	if state.NormalizeExecutionMode(executionMode) != state.ExecutionModePlan {
+		return false
+	}
+	if executorRole != RoleCoder {
+		return false
+	}
+	return strings.TrimSpace(planPath) != ""
+}
+
+func toolCallPathMatchesPlan(params map[string]any, planPath string) bool {
+	if len(params) == 0 {
+		return false
+	}
+	rawPath, ok := params["path"]
+	if !ok {
+		return false
+	}
+	path, ok := rawPath.(string)
+	if !ok {
+		return false
+	}
+	return normalizeRelativePathForMatch(path) == normalizeRelativePathForMatch(planPath)
+}
+
+func normalizeRelativePathForMatch(path string) string {
+	path = filepath.ToSlash(filepath.Clean(strings.TrimSpace(path)))
+	return strings.TrimPrefix(path, "./")
 }
 
 func (o *Orchestrator) buildReviewPrompt(projectBrief, prompt string, task PlanTask, executorOutput string) string {
@@ -698,14 +933,37 @@ func parseYAMLPlan(raw string) (YAMLPlan, error) {
 }
 
 func fallbackPlan(prompt string) YAMLPlan {
+	prompt = strings.TrimSpace(prompt)
 	return YAMLPlan{
 		Tasks: []PlanTask{
 			{
-				ID:          "task-1",
-				Description: strings.TrimSpace(prompt),
+				ID:            "task-1",
+				Description:   prompt,
+				FilesToCreate: inferFilesToCreateFromPrompt(prompt),
 			},
 		},
 	}
+}
+
+func inferFilesToCreateFromPrompt(prompt string) []string {
+	matches := regexp.MustCompile(`([A-Za-z0-9._/-]+\.[A-Za-z0-9]+)`).FindAllString(prompt, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(matches))
+	paths := make([]string, 0, len(matches))
+	for _, match := range matches {
+		path := normalizeRelativePathForMatch(match)
+		if path == "" || strings.HasPrefix(path, ".orchestra/") {
+			continue
+		}
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		paths = append(paths, path)
+	}
+	return paths
 }
 
 func renderPlanYAML(plan YAMLPlan) string {
@@ -766,14 +1024,24 @@ func depsSatisfied(deps []string, completed map[string]bool) bool {
 
 var planIDUnsafeChars = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
 
-func (o *Orchestrator) bindAgentToolSets() {
+func (o *Orchestrator) bindAgentToolSets(strategy ExecutionStrategy) {
 	workingDir := o.effectiveWorkingDir()
 	if o.Planner != nil {
-		o.Planner.BindToolSet(ToolEnv{
+		plannerEnv := ToolEnv{
 			WorkingDir: workingDir,
 			Role:       RolePlanner,
 			Emit:       o.emitEvent,
-		})
+		}
+		plannerTools := DefaultToolSetForRole(RolePlanner, plannerEnv)
+		if strategy == StrategyNoCoder || strategy == StrategySolo {
+			elevatedPlannerTools := NewToolSet(
+				newWriteFileTool(plannerEnv),
+				newRunCommandTool(plannerEnv, false),
+			)
+			plannerTools = mergeToolSets(plannerTools, elevatedPlannerTools)
+		}
+		o.Planner.ToolSet = plannerTools
+		o.Planner.AllowedTools = plannerTools.Names()
 	}
 	if o.Coder != nil {
 		o.Coder.BindToolSet(ToolEnv{
@@ -789,6 +1057,25 @@ func (o *Orchestrator) bindAgentToolSets() {
 			Emit:       o.emitEvent,
 		})
 	}
+}
+
+func mergeToolSets(sets ...ToolSet) ToolSet {
+	merged := make([]Tool, 0)
+	seen := make(map[string]struct{})
+	for _, set := range sets {
+		for _, tool := range set.ordered {
+			name := strings.TrimSpace(strings.ToLower(tool.Name))
+			if name == "" {
+				continue
+			}
+			if _, exists := seen[name]; exists {
+				continue
+			}
+			seen[name] = struct{}{}
+			merged = append(merged, tool)
+		}
+	}
+	return NewToolSet(merged...)
 }
 
 func (o *Orchestrator) effectiveWorkingDir() string {
@@ -819,6 +1106,9 @@ func normalizePlanID(planID string) string {
 }
 
 func (o *Orchestrator) persistPlanMarkdown(ctx context.Context, planID, prompt string, plan YAMLPlan, planYAML string) (string, error) {
+	if err := checkContextCancelled(ctx); err != nil {
+		return "", err
+	}
 	planID = normalizePlanID(planID)
 	if planID == "" {
 		return "", errors.New("plan id is empty")
@@ -870,6 +1160,9 @@ func renderPlanMarkdown(planID, prompt string, plan YAMLPlan, planYAML string) s
 }
 
 func (o *Orchestrator) writePlanFile(ctx context.Context, planPath, content string) (string, error) {
+	if err := checkContextCancelled(ctx); err != nil {
+		return "", err
+	}
 	params := map[string]any{
 		"path":    strings.TrimSpace(planPath),
 		"content": content,
@@ -878,6 +1171,8 @@ func (o *Orchestrator) writePlanFile(ctx context.Context, planPath, content stri
 		if _, ok := o.Planner.ToolSet.Get("write_plan_md"); ok {
 			if _, err := o.Planner.ExecuteTool(ctx, "write_plan_md", params); err == nil {
 				return strings.TrimSpace(planPath), nil
+			} else if IsUserCancelled(err) {
+				return "", err
 			}
 		}
 	}
@@ -898,6 +1193,9 @@ func (o *Orchestrator) writePlanFile(ctx context.Context, planPath, content stri
 }
 
 func (o *Orchestrator) updatePlanTaskStatus(ctx context.Context, planPath, taskID string, done bool) error {
+	if err := checkContextCancelled(ctx); err != nil {
+		return err
+	}
 	planPath = strings.TrimSpace(planPath)
 	taskID = strings.TrimSpace(taskID)
 	if planPath == "" || taskID == "" {
@@ -918,6 +1216,9 @@ func (o *Orchestrator) updatePlanTaskStatus(ctx context.Context, planPath, taskI
 	checkedPrefix := "- [x] " + taskID + " |"
 	changed := false
 	for i := range lines {
+		if err := checkContextCancelled(ctx); err != nil {
+			return err
+		}
 		switch {
 		case strings.HasPrefix(lines[i], uncheckedPrefix) && done:
 			lines[i] = strings.Replace(lines[i], "- [ ] ", "- [x] ", 1)
@@ -947,6 +1248,9 @@ func (o *Orchestrator) updatePlanTaskStatus(ctx context.Context, planPath, taskI
 }
 
 func (o *Orchestrator) writePlanLock(ctx context.Context, planID string) error {
+	if err := checkContextCancelled(ctx); err != nil {
+		return err
+	}
 	planID = normalizePlanID(planID)
 	if planID == "" {
 		return nil
@@ -978,11 +1282,52 @@ func (o *Orchestrator) writePlanLock(ctx context.Context, planID string) error {
 		Role:   RolePlanner,
 		Detail: "plan locked",
 	})
-	_ = ctx
 	return nil
 }
 
+func (o *Orchestrator) schedulePlanLockWrite(planID string) {
+	planID = normalizePlanID(planID)
+	if planID == "" {
+		return
+	}
+	go func(id string) {
+		timeoutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		done := make(chan error, 1)
+		writer := o.planLockWriter()
+		go func() {
+			done <- writer(timeoutCtx, id)
+		}()
+
+		select {
+		case err := <-done:
+			if err == nil {
+				return
+			}
+			err = normalizeCancellationErr(err)
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || IsUserCancelled(err) {
+				log.Printf("orchestra: agent: plan lock write timed out for %s: %v", id, err)
+				return
+			}
+			log.Printf("orchestra: agent: failed to write plan lock %s: %v", id, err)
+		case <-timeoutCtx.Done():
+			log.Printf("orchestra: agent: plan lock write timed out for %s: %v", id, timeoutCtx.Err())
+		}
+	}(planID)
+}
+
+func (o *Orchestrator) planLockWriter() func(context.Context, string) error {
+	if o != nil && o.writePlanLockFn != nil {
+		return o.writePlanLockFn
+	}
+	return o.writePlanLock
+}
+
 func (o *Orchestrator) buildTaskFileContext(ctx context.Context, executor *Agent, task PlanTask) string {
+	if err := checkContextCancelled(ctx); err != nil {
+		return ""
+	}
 	if executor == nil {
 		return ""
 	}
@@ -1013,8 +1358,14 @@ func (o *Orchestrator) buildTaskFileContext(ctx context.Context, executor *Agent
 	var b strings.Builder
 	totalChars := 0
 	for _, path := range paths {
+		if err := checkContextCancelled(ctx); err != nil {
+			return strings.TrimSpace(b.String())
+		}
 		result, err := executor.ExecuteTool(ctx, "read_file", map[string]any{"path": path})
 		if err != nil {
+			if IsUserCancelled(err) {
+				return strings.TrimSpace(b.String())
+			}
 			continue
 		}
 		content := strings.TrimSpace(result.Output)
@@ -1034,6 +1385,34 @@ func (o *Orchestrator) buildTaskFileContext(ctx context.Context, executor *Agent
 	return strings.TrimSpace(b.String())
 }
 
+func (o *Orchestrator) verifyCreatedFiles(paths []string) ([]string, error) {
+	if len(paths) == 0 {
+		return nil, nil
+	}
+	workingDir := o.effectiveWorkingDir()
+	missing := make([]string, 0, len(paths))
+	seen := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		if _, exists := seen[path]; exists {
+			continue
+		}
+		seen[path] = struct{}{}
+		absPath, relPath, err := resolveWorkspacePath(workingDir, path)
+		if err != nil {
+			return nil, fmt.Errorf("failed resolving task output path %q: %w", path, err)
+		}
+		info, err := os.Stat(absPath)
+		if err != nil || info.IsDir() {
+			missing = append(missing, relPath)
+		}
+	}
+	return missing, nil
+}
+
 func (o *Orchestrator) streamTokenCallback(role Role) func(token string) {
 	return func(token string) {
 		if token == "" {
@@ -1050,12 +1429,17 @@ func (o *Orchestrator) streamTokenCallback(role Role) func(token string) {
 	}
 }
 
-func (o *Orchestrator) runConversational(ctx context.Context, prompt string) error {
-	availability := o.collectAvailability(ctx)
-	responder := o.selectExecutor(availability)
+func (o *Orchestrator) runConversational(ctx context.Context, prompt string, strategy ExecutionStrategy) error {
+	if err := checkContextCancelled(ctx); err != nil {
+		return err
+	}
+	responder := o.Planner
 	if responder == nil {
-		err := errors.New("no available agents for conversational response")
-		o.emitEvent(AgentEvent{Type: EventError, Role: RoleCoder, Detail: err.Error()})
+		responder = o.selectExecutor(strategy)
+	}
+	if responder == nil {
+		err := errors.New("planner model is required; run /models and assign Planner before starting")
+		o.emitEvent(AgentEvent{Type: EventError, Role: RolePlanner, Detail: err.Error()})
 		o.emit(StepUpdate{StepID: "orchestrator", Status: "failed", Msg: err.Error()})
 		return err
 	}
@@ -1070,6 +1454,10 @@ func (o *Orchestrator) runConversational(ctx context.Context, prompt string) err
 		OnToken: o.streamTokenCallback(responder.Role),
 	})
 	if err != nil {
+		err = normalizeCancellationErr(err)
+		if IsUserCancelled(err) {
+			return err
+		}
 		o.emitEvent(AgentEvent{Type: EventError, Role: responder.Role, Detail: err.Error()})
 		o.emit(StepUpdate{StepID: "orchestrator", Status: "failed", Msg: err.Error()})
 		return err
@@ -1084,4 +1472,48 @@ func (o *Orchestrator) runConversational(ctx context.Context, prompt string) err
 	})
 	o.emit(StepUpdate{StepID: "orchestrator", Status: "done", Msg: "Conversational response complete"})
 	return nil
+}
+
+func shouldSuppressInternalUpdate(update StepUpdate) bool {
+	if containsInternalPath(update.Msg) {
+		return true
+	}
+	return containsInternalPath(update.PlanYAML)
+}
+
+func shouldSuppressInternalEvent(event AgentEvent) bool {
+	if containsInternalPath(event.Detail) {
+		return true
+	}
+	if strings.Contains(strings.ToLower(strings.TrimSpace(event.Detail)), "plan locked") {
+		return true
+	}
+	return payloadContainsInternalPath(event.Payload)
+}
+
+func payloadContainsInternalPath(payload any) bool {
+	switch typed := payload.(type) {
+	case FileDiffPayload:
+		return containsInternalPath(typed.Path)
+	case *FileDiffPayload:
+		if typed == nil {
+			return false
+		}
+		return containsInternalPath(typed.Path)
+	case map[string]any:
+		for _, value := range typed {
+			if text, ok := value.(string); ok && containsInternalPath(text) {
+				return true
+			}
+		}
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return containsInternalPath(fmt.Sprintf("%v", payload))
+	}
+	return containsInternalPath(string(raw))
+}
+
+func containsInternalPath(text string) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(text)), ".orchestra/")
 }

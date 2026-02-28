@@ -36,8 +36,9 @@ type Agent struct {
 }
 
 type RunOptions struct {
-	Mode    DispatchMode
-	OnToken func(token string)
+	Mode       DispatchMode
+	OnToken    func(token string)
+	OnToolCall func(name string, params map[string]any, result ToolResult, err error)
 }
 
 var ErrAgentNotReady = errors.New("agent is not initialized")
@@ -149,11 +150,18 @@ func (a *Agent) RunWithOptions(ctx context.Context, userPrompt string, session *
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := checkContextCancelled(ctx); err != nil {
+		return "", err
+	}
 
 	if err := a.Validate(); err != nil {
 		return "", err
 	}
 	if err := a.Provider.Ping(ctx); err != nil {
+		err = normalizeCancellationErr(err)
+		if IsUserCancelled(err) {
+			return "", err
+		}
 		return "", fmt.Errorf("%s agent provider is not ready: %w", a.Role, err)
 	}
 	dispatchMode := options.Mode
@@ -167,6 +175,12 @@ func (a *Agent) RunWithOptions(ctx context.Context, userPrompt string, session *
 	var ragContext string
 	if dispatchMode == DispatchModeTask && a.Indexer != nil {
 		chunks, err := a.Indexer.Query(ctx, userPrompt)
+		if err != nil {
+			err = normalizeCancellationErr(err)
+			if IsUserCancelled(err) {
+				return "", err
+			}
+		}
 		if err == nil && len(chunks) > 0 {
 			var sb strings.Builder
 			sb.WriteString("Relevant codebase context:\n")
@@ -187,12 +201,19 @@ func (a *Agent) RunWithOptions(ctx context.Context, userPrompt string, session *
 	}
 
 	if db != nil && session != nil {
-		history, _ := db.GetMessages(ctx, session.ID)
-		for _, h := range history {
-			messages = append(messages, providers.Message{
-				Role:    h.Role,
-				Content: h.Content,
-			})
+		history, err := db.GetMessages(ctx, session.ID)
+		if err != nil {
+			err = normalizeCancellationErr(err)
+			if IsUserCancelled(err) {
+				return "", err
+			}
+		} else {
+			for _, h := range history {
+				messages = append(messages, providers.Message{
+					Role:    h.Role,
+					Content: h.Content,
+				})
+			}
 		}
 	}
 
@@ -222,8 +243,15 @@ func (a *Agent) RunWithOptions(ctx context.Context, userPrompt string, session *
 	var finalText string
 
 	for iteration := 0; iteration < maxIterations; iteration++ {
+		if err := checkContextCancelled(ctx); err != nil {
+			return "", err
+		}
 		response, err := a.Provider.Complete(ctx, a.Model, messages, pTools, options.OnToken)
 		if err != nil {
+			err = normalizeCancellationErr(err)
+			if IsUserCancelled(err) {
+				return "", err
+			}
 			return "", err
 		}
 
@@ -241,19 +269,42 @@ func (a *Agent) RunWithOptions(ctx context.Context, userPrompt string, session *
 
 		// Execute each tool call and append results.
 		for _, tc := range response.ToolCalls {
-			var params map[string]any
-			if len(tc.Arguments) > 0 {
-				if err := json.Unmarshal(tc.Arguments, &params); err != nil {
-					params = map[string]any{}
-				}
+			if err := checkContextCancelled(ctx); err != nil {
+				return "", err
 			}
-
-			result, execErr := a.ExecuteTool(ctx, tc.Name, params)
+			params, parseErr := parseToolArguments(tc.Arguments)
 			var resultContent string
-			if execErr != nil {
-				resultContent = fmt.Sprintf("error: %s", execErr.Error())
+			if parseErr != nil {
+				if options.OnToolCall != nil {
+					options.OnToolCall(tc.Name, nil, ToolResult{}, parseErr)
+				}
+				resultContent = fmt.Sprintf("error: invalid tool arguments for %s: %v", strings.TrimSpace(tc.Name), parseErr)
 			} else {
-				resultContent = result.Output
+				result, execErr := a.ExecuteTool(ctx, tc.Name, params)
+				if options.OnToolCall != nil {
+					options.OnToolCall(tc.Name, params, result, execErr)
+				}
+				if execErr != nil {
+					execErr = normalizeCancellationErr(execErr)
+					if IsUserCancelled(execErr) {
+						return "", execErr
+					}
+					resultContent = fmt.Sprintf(`{"ok":false,"error":%q}`, execErr.Error())
+				} else {
+					payload := map[string]any{
+						"ok":     true,
+						"output": result.Output,
+					}
+					if len(result.Data) > 0 {
+						payload["data"] = result.Data
+					}
+					raw, err := json.Marshal(payload)
+					if err != nil {
+						resultContent = result.Output
+					} else {
+						resultContent = string(raw)
+					}
+				}
 			}
 
 			messages = append(messages, providers.Message{
@@ -265,6 +316,9 @@ func (a *Agent) RunWithOptions(ctx context.Context, userPrompt string, session *
 		// Continue the loop — the LLM will see the tool results and either
 		// call more tools or produce a final text response.
 	}
+	if strings.TrimSpace(finalText) == "" {
+		return "", errors.New("agent exceeded tool-call iteration limit without a final response")
+	}
 
 	if db != nil && session != nil {
 		_ = db.SaveMessage(ctx, session.ID, "user", string(a.Role), finalPrompt, 0)
@@ -272,4 +326,29 @@ func (a *Agent) RunWithOptions(ctx context.Context, userPrompt string, session *
 	}
 
 	return finalText, nil
+}
+
+func parseToolArguments(raw json.RawMessage) (map[string]any, error) {
+	if len(raw) == 0 {
+		return map[string]any{}, nil
+	}
+
+	var params map[string]any
+	if err := json.Unmarshal(raw, &params); err == nil {
+		return params, nil
+	}
+
+	// Some providers return arguments as an encoded JSON string.
+	var encoded string
+	if err := json.Unmarshal(raw, &encoded); err == nil {
+		encoded = strings.TrimSpace(encoded)
+		if encoded == "" {
+			return map[string]any{}, nil
+		}
+		if err := json.Unmarshal([]byte(encoded), &params); err == nil {
+			return params, nil
+		}
+	}
+
+	return nil, fmt.Errorf("unable to parse tool arguments: %s", string(raw))
 }

@@ -11,33 +11,44 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+var splashCardBG = lipgloss.Color("236")
+
 var (
 	chatViewportStyle = lipgloss.NewStyle().Border(lipgloss.NormalBorder(), false, false, true, false).BorderForeground(lipgloss.Color("238"))
 	userInputStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Bold(true)
 	assistantStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("212"))
 	systemStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Italic(true)
+	activityStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("45")).Bold(true).Padding(0, 1)
+	activityMetaStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+	diffBoxStyle      = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("240")).Padding(0, 1)
+	diffHeaderStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("81")).Bold(true)
+	diffAddStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	diffDelStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	diffCtxStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 	suggestBoxStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("250"))
 	suggestNameStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true)
 	suggestDescStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 	suggestSelStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("51")).Bold(true)
 	splashLogoBlue    = lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true)
-	splashLogoWhite    = lipgloss.NewStyle().Foreground(lipgloss.Color("255")).Bold(true)
+	splashLogoWhite   = lipgloss.NewStyle().Foreground(lipgloss.Color("255")).Bold(true)
 	splashLogoYellow  = lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Bold(true)
 	splashCardStyle   = lipgloss.NewStyle().
 				Border(lipgloss.NormalBorder(), false, false, false, true).
 				BorderForeground(lipgloss.Color("39")).
 				Padding(1, 2).
-				Background(lipgloss.Color("236"))
-	splashPromptStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
-	splashHintStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	splashCursorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("255")).Bold(true)
-	splashTipStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
-	loadingStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Bold(true)
-	loadingTimerStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
-	placeholderStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Italic(true)
-	roleLabelCoderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("212")).Bold(true)
-	roleLabelOtherStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true)
-	promptIndicator     = lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Bold(true)
+				Background(splashCardBG)
+	splashPromptStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Background(splashCardBG)
+	splashHintStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("245")).Background(splashCardBG)
+	splashCursorStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("255")).Background(splashCardBG).Bold(true)
+	splashPlaceholderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Background(splashCardBG).Italic(true)
+	splashPromptIndicator  = lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Background(splashCardBG).Bold(true)
+	splashTipStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
+	loadingStyle           = lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Bold(true)
+	loadingTimerStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+	placeholderStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Italic(true)
+	roleLabelCoderStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("212")).Bold(true)
+	roleLabelOtherStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true)
+	promptIndicator        = lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Bold(true)
 )
 
 var orchestraBlockGlyphs = map[rune][]string{
@@ -105,6 +116,21 @@ type LoadingTickMsg struct{}
 type ChatMessage struct {
 	Sender  string
 	Content string
+	Diff    *FileDiffMessage
+}
+
+type FileDiffMessage struct {
+	Path     string
+	OldLines []string
+	NewLines []string
+}
+
+type ActivityLine struct {
+	Phase     string
+	Action    string
+	Target    string
+	Key       string
+	StartedAt time.Time
 }
 
 type ChatModel struct {
@@ -115,11 +141,16 @@ type ChatModel struct {
 	slashSuggestions []slashCommand
 	selectedSlashIdx int
 	lastSuggestInput string
+	inputEnabled     bool
+	inputHint        string
 	width            int
 	height           int
 	isLoading        bool
 	loadingStarted   time.Time
 	loadingRole      string
+	stickToBottom    bool
+	activity         ActivityLine
+	activityVisible  bool
 }
 
 func NewChatModel() *ChatModel {
@@ -131,6 +162,7 @@ func NewChatModel() *ChatModel {
 	ti.Width = 50
 
 	vp := viewport.New(0, 0)
+	vp.MouseWheelEnabled = true
 	vp.SetContent("")
 
 	return &ChatModel{
@@ -138,6 +170,8 @@ func NewChatModel() *ChatModel {
 		textInput:        ti,
 		keyedMessages:    make(map[string]int),
 		selectedSlashIdx: -1,
+		inputEnabled:     true,
+		stickToBottom:    true,
 	}
 }
 
@@ -160,6 +194,9 @@ func (m *ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	m.viewport, cmd = m.viewport.Update(msg)
 	cmds = append(cmds, cmd)
+	if isScrollInteraction(msg) {
+		m.stickToBottom = m.viewport.AtBottom()
+	}
 
 	return m, tea.Batch(cmds...)
 }
@@ -206,7 +243,22 @@ func loadingTickCmd() tea.Cmd {
 func (m *ChatModel) AddMessage(sender, content string) {
 	m.messages = append(m.messages, ChatMessage{Sender: sender, Content: content})
 	m.renderMessages()
-	m.viewport.GotoBottom()
+}
+
+func (m *ChatModel) AddFileDiff(path string, oldLines, newLines []string) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		path = "(unknown file)"
+	}
+	m.messages = append(m.messages, ChatMessage{
+		Sender: "System",
+		Diff: &FileDiffMessage{
+			Path:     path,
+			OldLines: append([]string(nil), oldLines...),
+			NewLines: append([]string(nil), newLines...),
+		},
+	})
+	m.renderMessages()
 }
 
 func (m *ChatModel) SetSystemMessageByKey(key, content string) {
@@ -225,7 +277,6 @@ func (m *ChatModel) SetSystemMessageByKey(key, content string) {
 		m.keyedMessages[key] = len(m.messages) - 1
 	}
 	m.renderMessages()
-	m.viewport.GotoBottom()
 }
 
 func (m *ChatModel) ReleaseMessageKey(key string) {
@@ -245,8 +296,13 @@ func (m *ChatModel) renderMessages() {
 		contentWidth = 80
 	}
 
+	prevOffset := m.viewport.YOffset
 	var blocks []string
 	for _, msg := range m.messages {
+		if msg.Diff != nil {
+			blocks = append(blocks, m.renderDiffBlock(*msg.Diff, contentWidth))
+			continue
+		}
 		content := strings.TrimSpace(msg.Content)
 		var block string
 		switch msg.Sender {
@@ -267,6 +323,11 @@ func (m *ChatModel) renderMessages() {
 		blocks = append(blocks, block)
 	}
 	m.viewport.SetContent(strings.Join(blocks, "\n\n"))
+	if m.stickToBottom {
+		m.viewport.GotoBottom()
+	} else {
+		m.viewport.SetYOffset(prevOffset)
+	}
 }
 
 func (m *ChatModel) View() string {
@@ -276,19 +337,14 @@ func (m *ChatModel) View() string {
 
 	vpView := chatViewportStyle.Width(m.width).Render(m.viewport.View())
 
-	var loadingView string
-	if m.isLoading {
-		loadingView = m.renderLoadingIndicator()
-	}
-
-	inputView := lipgloss.NewStyle().Padding(0, 1).Render(m.renderInputForView())
+	inputView := m.renderInputArea()
 
 	var parts []string
 	parts = append(parts, vpView)
-	if loadingView != "" {
-		parts = append(parts, loadingView)
+	if m.activityVisible {
+		parts = append(parts, m.renderActivityLine())
 	}
-	if len(m.slashSuggestions) > 0 {
+	if m.inputEnabled && len(m.slashSuggestions) > 0 {
 		lines := m.renderSuggestionsForWidth(max(16, m.width-4))
 		suggestView := suggestBoxStyle.Width(m.width).Padding(0, 1).Render(strings.Join(lines, "\n"))
 		parts = append(parts, suggestView)
@@ -310,6 +366,79 @@ func (m *ChatModel) renderLoadingIndicator() string {
 
 	timerStr := formatElapsed(elapsed)
 	return loadingStyle.Render(spinner+" "+role+" is thinking...") + " " + loadingTimerStyle.Render(timerStr)
+}
+
+func (m *ChatModel) SetActivity(phase, action, target, key string) {
+	phase = strings.TrimSpace(phase)
+	action = strings.TrimSpace(action)
+	target = strings.TrimSpace(target)
+	key = strings.TrimSpace(key)
+	if phase == "" && action == "" && target == "" {
+		m.ClearActivity()
+		return
+	}
+	if key == "" {
+		key = phase + "|" + action + "|" + target
+	}
+	if m.activityVisible && m.activity.Key == key {
+		m.activity.Phase = phase
+		m.activity.Action = action
+		m.activity.Target = target
+		return
+	}
+	m.activity = ActivityLine{
+		Phase:     phase,
+		Action:    action,
+		Target:    target,
+		Key:       key,
+		StartedAt: time.Now(),
+	}
+	m.activityVisible = true
+	m.reflow()
+}
+
+func (m *ChatModel) ClearActivity() {
+	if !m.activityVisible {
+		return
+	}
+	m.activity = ActivityLine{}
+	m.activityVisible = false
+	m.reflow()
+}
+
+func (m *ChatModel) renderActivityLine() string {
+	if !m.activityVisible {
+		return ""
+	}
+	started := m.activity.StartedAt
+	if started.IsZero() {
+		started = time.Now()
+	}
+	elapsed := time.Since(started).Round(time.Second)
+	spinnerFrames := []string{"●", "◉", "○", "◉"}
+	frameIdx := int(elapsed.Seconds()) % len(spinnerFrames)
+	spinner := spinnerFrames[frameIdx]
+
+	label := strings.TrimSpace(m.activity.Phase + " " + m.activity.Action)
+	if label == "" {
+		label = "Working"
+	}
+	target := strings.TrimSpace(m.activity.Target)
+	if target != "" {
+		label += "  ·  " + target
+	}
+	meta := fmt.Sprintf("(%s · esc/ctrl+c to interrupt)", formatActivityElapsed(elapsed))
+	return activityStyle.Render(spinner+" "+label) + "  " + activityMetaStyle.Render(meta)
+}
+
+func formatActivityElapsed(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	secs := int(d.Seconds())
+	mins := secs / 60
+	secs = secs % 60
+	return fmt.Sprintf("%dm %02ds", mins, secs)
 }
 
 func formatElapsed(d time.Duration) string {
@@ -344,17 +473,21 @@ func (m *ChatModel) emptyStateView() string {
 		splashPromptStyle.Render(`Ask anything... "Fix broken tests"`),
 		"",
 	}
-	inputLines := strings.Split(m.renderSimpleInput(ti), "\n")
-	if len(inputLines) == 0 {
-		inputLines = []string{""}
+	if m.inputEnabled {
+		inputLines := strings.Split(m.renderSimpleInput(ti), "\n")
+		if len(inputLines) == 0 {
+			inputLines = []string{""}
+		}
+		inputLines[0] = splashPromptIndicator.Render("> ") + inputLines[0]
+		for i := 1; i < len(inputLines); i++ {
+			inputLines[i] = "  " + inputLines[i]
+		}
+		cardLines = append(cardLines, strings.Join(inputLines, "\n"))
 	}
-	inputLines[0] = promptIndicator.Render("> ") + inputLines[0]
-	for i := 1; i < len(inputLines); i++ {
-		inputLines[i] = "  " + inputLines[i]
-	}
-	cardLines = append(cardLines, strings.Join(inputLines, "\n"))
-	if len(m.slashSuggestions) > 0 {
+	if m.inputEnabled && len(m.slashSuggestions) > 0 {
 		cardLines = append(cardLines, "", strings.Join(m.renderSuggestionsForWidth(max(16, cardWidth-6)), "\n"))
+	} else if !m.inputEnabled {
+		cardLines = append(cardLines, "", systemStyle.Render(wrapToWidth(m.inputDisabledHint(), max(16, cardWidth-4))))
 	}
 
 	card := splashCardStyle.Width(cardWidth).Render(strings.Join(cardLines, "\n"))
@@ -406,20 +539,23 @@ func (m *ChatModel) renderOrchestraLogo() string {
 }
 
 func (m *ChatModel) renderCompactOrchestraSubLogo() string {
-	chars := []rune("Create Your Team of AI Agents")
-	var b strings.Builder
-	for i, ch := range chars {
-//i want white
-		style := splashLogoWhite 
-		// if i >= len(chars)-3 {
-		// 	style = placeholderStyle
-		// }
-		b.WriteString(style.Render(string(ch)))
-		if i < len(chars)-1 {
-			b.WriteRune(' ')
+	var word strings.Builder
+	for i, ch := range []rune("ORCHESTRA") {
+		word.WriteString(splashLogoWhite.Render(string(ch)))
+		if i < len("ORCHESTRA")-1 {
+			word.WriteRune(' ')
 		}
 	}
-	return b.String()
+
+	var subtitle strings.Builder
+	for i, ch := range []rune("Create Your Team of AI Agents") {
+		subtitle.WriteString(splashLogoWhite.Render(string(ch)))
+		if i < len([]rune("Create Your Team of AI Agents"))-1 {
+			subtitle.WriteRune(' ')
+		}
+	}
+
+	return word.String() + "\n" + subtitle.String()
 }
 
 func (m *ChatModel) renderSimpleInput(ti textinput.Model) string {
@@ -442,7 +578,7 @@ func (m *ChatModel) renderSimpleInput(ti textinput.Model) string {
 
 	// Show placeholder if input is empty
 	if len(valueRunes) == 0 {
-		placeholder := placeholderStyle.Render("Type your message or @path/to/file")
+		placeholder := splashPlaceholderStyle.Render("Type your message or @path/to/file")
 		return cursor + placeholder
 	}
 
@@ -458,7 +594,16 @@ func (m *ChatModel) ClearInput() {
 	m.updateSlashSuggestions()
 }
 
+func (m *ChatModel) SetInputValue(value string) {
+	m.textInput.SetValue(value)
+	m.textInput.CursorEnd()
+	m.updateSlashSuggestions()
+}
+
 func (m *ChatModel) ApplyTopSlashSuggestion() bool {
+	if !m.inputEnabled {
+		return false
+	}
 	suggestion, ok := m.SelectedSlashSuggestion()
 	if !ok {
 		return false
@@ -482,6 +627,9 @@ func (m *ChatModel) SelectedSlashSuggestion() (slashCommand, bool) {
 }
 
 func (m *ChatModel) MoveSlashSelection(delta int) bool {
+	if !m.inputEnabled {
+		return false
+	}
 	if len(m.slashSuggestions) == 0 {
 		return false
 	}
@@ -501,7 +649,22 @@ func (m *ChatModel) MoveSlashSelection(delta int) bool {
 	return true
 }
 
+func (m *ChatModel) HasVisibleSuggestions() bool {
+	if m == nil || !m.inputEnabled {
+		return false
+	}
+	return len(m.slashSuggestions) > 0
+}
+
 func (m *ChatModel) updateSlashSuggestions() {
+	if !m.inputEnabled {
+		m.slashSuggestions = nil
+		m.selectedSlashIdx = -1
+		m.lastSuggestInput = m.textInput.Value()
+		m.reflow()
+		return
+	}
+
 	input := m.textInput.Value()
 	inputChanged := input != m.lastSuggestInput
 	m.lastSuggestInput = input
@@ -531,12 +694,12 @@ func (m *ChatModel) reflow() {
 
 	inputHeight := m.inputHeight()
 	suggestHeight := m.suggestionsHeight()
-	loadingHeight := 0
-	if m.isLoading {
-		loadingHeight = 1
+	activityHeight := 0
+	if m.activityVisible {
+		activityHeight = 1
 	}
 
-	vpHeight := m.height - inputHeight - suggestHeight - loadingHeight - 1
+	vpHeight := m.height - inputHeight - suggestHeight - activityHeight - 1
 	if vpHeight < 0 {
 		vpHeight = 0
 	}
@@ -607,7 +770,7 @@ func (m *ChatModel) renderSuggestionsForWidth(width int) []string {
 }
 
 func (m *ChatModel) inputHeight() int {
-	input := m.renderInputForView()
+	input := m.renderInputArea()
 	height := lipgloss.Height(input)
 	if height < 1 {
 		return 1
@@ -620,6 +783,126 @@ func (m *ChatModel) suggestionsHeight() int {
 		return 0
 	}
 	return lipgloss.Height(strings.Join(m.renderSuggestionsForWidth(max(16, m.width-4)), "\n"))
+}
+
+type diffLineKind int
+
+const (
+	diffLineContext diffLineKind = iota
+	diffLineAdded
+	diffLineRemoved
+)
+
+type diffLine struct {
+	kind diffLineKind
+	text string
+}
+
+func (m *ChatModel) renderDiffBlock(diff FileDiffMessage, width int) string {
+	const maxRenderedLines = 20
+	lines := computeLineDiff(diff.OldLines, diff.NewLines)
+	totalLines := len(lines)
+	if totalLines > maxRenderedLines {
+		lines = lines[:maxRenderedLines]
+	}
+
+	contentWidth := width - 6
+	if contentWidth < 16 {
+		contentWidth = 16
+	}
+
+	var body []string
+	for _, line := range lines {
+		prefix := "  "
+		style := diffCtxStyle
+		switch line.kind {
+		case diffLineAdded:
+			prefix = "+ "
+			style = diffAddStyle
+		case diffLineRemoved:
+			prefix = "- "
+			style = diffDelStyle
+		}
+		body = append(body, style.Render(truncateRunes(prefix+line.text, contentWidth)))
+	}
+	if totalLines > maxRenderedLines {
+		remaining := totalLines - maxRenderedLines
+		body = append(body, diffCtxStyle.Render(fmt.Sprintf("… %d more line(s)", remaining)))
+	}
+	if len(body) == 0 {
+		body = append(body, diffCtxStyle.Render("(no textual changes)"))
+	}
+
+	header := diffHeaderStyle.Render("Diff  " + diff.Path)
+	block := diffBoxStyle.Width(width).Render(header + "\n" + strings.Join(body, "\n"))
+	return block
+}
+
+func computeLineDiff(oldLines, newLines []string) []diffLine {
+	n := len(oldLines)
+	m := len(newLines)
+	if n == 0 && m == 0 {
+		return nil
+	}
+
+	dp := make([][]int, n+1)
+	for i := range dp {
+		dp[i] = make([]int, m+1)
+	}
+	for i := n - 1; i >= 0; i-- {
+		for j := m - 1; j >= 0; j-- {
+			if oldLines[i] == newLines[j] {
+				dp[i][j] = dp[i+1][j+1] + 1
+				continue
+			}
+			if dp[i+1][j] >= dp[i][j+1] {
+				dp[i][j] = dp[i+1][j]
+			} else {
+				dp[i][j] = dp[i][j+1]
+			}
+		}
+	}
+
+	out := make([]diffLine, 0, n+m)
+	i, j := 0, 0
+	for i < n && j < m {
+		if oldLines[i] == newLines[j] {
+			out = append(out, diffLine{kind: diffLineContext, text: oldLines[i]})
+			i++
+			j++
+			continue
+		}
+		if dp[i+1][j] >= dp[i][j+1] {
+			out = append(out, diffLine{kind: diffLineRemoved, text: oldLines[i]})
+			i++
+		} else {
+			out = append(out, diffLine{kind: diffLineAdded, text: newLines[j]})
+			j++
+		}
+	}
+	for i < n {
+		out = append(out, diffLine{kind: diffLineRemoved, text: oldLines[i]})
+		i++
+	}
+	for j < m {
+		out = append(out, diffLine{kind: diffLineAdded, text: newLines[j]})
+		j++
+	}
+	return out
+}
+
+func truncateRunes(value string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= maxRunes {
+		return value
+	}
+	if maxRunes <= 1 {
+		return string(runes[:maxRunes])
+	}
+	return string(runes[:maxRunes-1]) + "…"
 }
 
 // styleWrappedPrefixStyled renders a prefix with one style and content with another.
@@ -655,4 +938,42 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func (m *ChatModel) SetInputAvailability(enabled bool, hint string) {
+	m.inputEnabled = enabled
+	m.inputHint = strings.TrimSpace(hint)
+	if !enabled {
+		m.slashSuggestions = nil
+		m.selectedSlashIdx = -1
+	}
+	m.reflow()
+}
+
+func (m *ChatModel) renderInputArea() string {
+	if m.inputEnabled {
+		return lipgloss.NewStyle().Padding(0, 1).Render(m.renderInputForView())
+	}
+	return lipgloss.NewStyle().Padding(0, 1).Render(systemStyle.Render(wrapToWidth(m.inputDisabledHint(), m.inputWrapWidth())))
+}
+
+func (m *ChatModel) inputDisabledHint() string {
+	hint := strings.TrimSpace(m.inputHint)
+	if hint != "" {
+		return hint
+	}
+	return "This role is internal and cannot be addressed directly."
+}
+
+func isScrollInteraction(msg tea.Msg) bool {
+	switch typed := msg.(type) {
+	case tea.MouseMsg:
+		return true
+	case tea.KeyMsg:
+		switch typed.String() {
+		case "up", "down", "pgup", "pgdown", "ctrl+u", "ctrl+d", "u", "d", "home", "end":
+			return true
+		}
+	}
+	return false
 }

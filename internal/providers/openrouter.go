@@ -8,8 +8,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-
-	"github.com/zalando/go-keyring"
 )
 
 const (
@@ -50,9 +48,9 @@ func (p *OpenRouter) Name() string {
 }
 
 func (p *OpenRouter) getKey() (string, error) {
-	key, err := keyring.Get("orchestra", p.KeyName)
+	key, err := LoadCredential(p.KeyName)
 	if err != nil || strings.TrimSpace(key) == "" {
-		return "", &ProviderAuthError{ProviderName: p.KeyName, Msg: "API key not found in keyring"}
+		return "", &ProviderAuthError{ProviderName: p.KeyName, Msg: "API key not found. Run /connect to reconnect provider."}
 	}
 	return strings.TrimSpace(key), nil
 }

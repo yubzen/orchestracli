@@ -9,8 +9,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-
-	"github.com/zalando/go-keyring"
 )
 
 type Anthropic struct {
@@ -26,9 +24,9 @@ func (p *Anthropic) Name() string {
 }
 
 func (p *Anthropic) getKey() (string, error) {
-	key, err := keyring.Get("orchestra", "anthropic")
-	if err != nil || key == "" {
-		return "", &ProviderAuthError{ProviderName: "anthropic", Msg: "API key not found in keyring"}
+	key, err := LoadCredential("anthropic")
+	if err != nil || strings.TrimSpace(key) == "" {
+		return "", &ProviderAuthError{ProviderName: "anthropic", Msg: "API key not found. Run /connect to reconnect provider."}
 	}
 	return key, nil
 }

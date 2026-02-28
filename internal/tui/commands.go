@@ -21,8 +21,8 @@ type slashCommand struct {
 }
 
 var slashCommands = []slashCommand{
-	{Name: "/roles", Description: "Switch active agent role"},
-	{Name: "/models", Description: "List and switch models"},
+	{Name: "/roles", Description: "Choose role to configure"},
+	{Name: "/models", Description: "Configure role models"},
 	{Name: "/compact", Description: "Compact chat history"},
 	{Name: "/mcps", Description: "Show MCP connections"},
 	{Name: "/status", Description: "Toggle status overlay"},

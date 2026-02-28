@@ -227,7 +227,7 @@ func main() {
 			defer rt.Close()
 
 			app := tui.NewAppModel(cfg, rt.db, rt.session, rt.orchestrator)
-			p := tea.NewProgram(app, tea.WithAltScreen(), tea.WithContext(rt.ctx))
+			p := tea.NewProgram(app, tea.WithAltScreen(), tea.WithMouseCellMotion(), tea.WithContext(rt.ctx))
 			_, err = p.Run()
 			if err != nil {
 				return err

@@ -199,6 +199,9 @@ func newReadFileTool(env ToolEnv) Tool {
 		Name:        "read_file",
 		Description: "Read UTF-8 text from a file under the current workspace.",
 		Execute: func(ctx context.Context, params map[string]any) (ToolResult, error) {
+			if err := checkContextCancelled(ctx); err != nil {
+				return ToolResult{}, err
+			}
 			path, err := requiredStringParam(params, "path")
 			if err != nil {
 				return ToolResult{}, err
@@ -229,6 +232,9 @@ func newWriteFileTool(env ToolEnv) Tool {
 		Name:        "write_file",
 		Description: "Write full file content to a workspace path.",
 		Execute: func(ctx context.Context, params map[string]any) (ToolResult, error) {
+			if err := checkContextCancelled(ctx); err != nil {
+				return ToolResult{}, err
+			}
 			path, err := requiredStringParam(params, "path")
 			if err != nil {
 				return ToolResult{}, err
@@ -242,6 +248,14 @@ func newWriteFileTool(env ToolEnv) Tool {
 			if err != nil {
 				return ToolResult{}, err
 			}
+
+			var oldContent string
+			if existing, readErr := os.ReadFile(absPath); readErr == nil {
+				oldContent = string(existing)
+			} else if !errors.Is(readErr, os.ErrNotExist) {
+				return ToolResult{}, readErr
+			}
+
 			emitToolEvent(env, EventWriting, fmt.Sprintf("writing %s", relPath), map[string]any{"path": relPath})
 
 			if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
@@ -249,6 +263,13 @@ func newWriteFileTool(env ToolEnv) Tool {
 			}
 			if err := os.WriteFile(absPath, []byte(content), 0o644); err != nil {
 				return ToolResult{}, err
+			}
+			if shouldEmitFileDiff(relPath) {
+				emitToolEvent(env, EventFileDiff, fmt.Sprintf("diff %s", relPath), FileDiffPayload{
+					Path:     relPath,
+					OldLines: splitLinesForDiff(oldContent),
+					NewLines: splitLinesForDiff(content),
+				})
 			}
 			return ToolResult{
 				Output: "ok",
@@ -267,6 +288,9 @@ func newWritePlanTool(env ToolEnv) Tool {
 		Name:        "write_plan_md",
 		Description: "Write a task plan markdown file only to .orchestra/plans/<task_id>.md.",
 		Execute: func(ctx context.Context, params map[string]any) (ToolResult, error) {
+			if err := checkContextCancelled(ctx); err != nil {
+				return ToolResult{}, err
+			}
 			path, err := requiredStringParam(params, "path")
 			if err != nil {
 				return ToolResult{}, err
@@ -315,6 +339,9 @@ func newRunCommandTool(env ToolEnv, readOnly bool) Tool {
 		Name:        "run_command",
 		Description: description,
 		Execute: func(ctx context.Context, params map[string]any) (ToolResult, error) {
+			if err := checkContextCancelled(ctx); err != nil {
+				return ToolResult{}, err
+			}
 			command, err := requiredStringParam(params, "command")
 			if err != nil {
 				return ToolResult{}, err
@@ -334,6 +361,10 @@ func newRunCommandTool(env ToolEnv, readOnly bool) Tool {
 			out, err := cmd.CombinedOutput()
 			output := strings.TrimSpace(string(out))
 			if err != nil {
+				err = normalizeCancellationErr(err)
+				if IsUserCancelled(err) {
+					return ToolResult{}, err
+				}
 				if output == "" {
 					return ToolResult{}, err
 				}
@@ -411,6 +442,27 @@ func emitToolEvent(env ToolEnv, eventType AgentEventType, detail string, payload
 		Detail:  strings.TrimSpace(detail),
 		Payload: payload,
 	})
+}
+
+func splitLinesForDiff(content string) []string {
+	content = strings.ReplaceAll(content, "\r\n", "\n")
+	if content == "" {
+		return nil
+	}
+	lines := strings.Split(content, "\n")
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return lines
+}
+
+func shouldEmitFileDiff(relPath string) bool {
+	normalized := filepath.ToSlash(filepath.Clean(strings.TrimSpace(relPath)))
+	normalized = strings.TrimPrefix(normalized, "./")
+	if normalized == ".orchestra" {
+		return false
+	}
+	return !strings.HasPrefix(normalized, ".orchestra/")
 }
 
 func isReadOnlyCommand(command string) bool {

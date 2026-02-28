@@ -68,6 +68,12 @@ func migrate(db *sql.DB) error {
 		model_id TEXT NOT NULL,
 		updated_at DATETIME,
 		PRIMARY KEY (session_id, role)
+	);
+	CREATE TABLE IF NOT EXISTS session_input_history (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		session_id TEXT NOT NULL,
+		content TEXT NOT NULL,
+		created_at DATETIME
 	);`
 	_, err := db.Exec(schema)
 	return err

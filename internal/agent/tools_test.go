@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -74,5 +75,93 @@ func TestReadOnlyRunCommandTool(t *testing.T) {
 		"command": "echo hello > file.txt",
 	}); err == nil {
 		t.Fatal("expected read-only command restriction to reject write redirect")
+	}
+}
+
+func TestWriteFileToolEmitsFileDiffEvent(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	events := make([]AgentEvent, 0, 4)
+	toolSet := DefaultToolSetForRole(RoleCoder, ToolEnv{
+		WorkingDir: root,
+		Role:       RoleCoder,
+		Emit: func(event AgentEvent) {
+			events = append(events, event)
+		},
+	})
+	tool, ok := toolSet.Get("write_file")
+	if !ok {
+		t.Fatal("expected write_file tool")
+	}
+
+	_, err := tool.Execute(context.Background(), map[string]any{
+		"path":    "hamid.ts",
+		"content": "export const a = 1\n",
+	})
+	if err != nil {
+		t.Fatalf("first write failed: %v", err)
+	}
+	_, err = tool.Execute(context.Background(), map[string]any{
+		"path":    "hamid.ts",
+		"content": "export const a = 2\n",
+	})
+	if err != nil {
+		t.Fatalf("second write failed: %v", err)
+	}
+
+	foundDiff := false
+	for _, event := range events {
+		if event.Type != EventFileDiff {
+			continue
+		}
+		payload, ok := event.Payload.(FileDiffPayload)
+		if !ok {
+			t.Fatalf("expected file diff payload type, got %T", event.Payload)
+		}
+		if payload.Path != "hamid.ts" {
+			continue
+		}
+		oldJoined := strings.Join(payload.OldLines, "\n")
+		newJoined := strings.Join(payload.NewLines, "\n")
+		if strings.Contains(oldJoined, "a = 1") && strings.Contains(newJoined, "a = 2") {
+			foundDiff = true
+			break
+		}
+	}
+	if !foundDiff {
+		t.Fatalf("expected EventFileDiff for hamid.ts, got events: %#v", events)
+	}
+}
+
+func TestWriteFileToolSkipsDiffEventsForOrchestraInternalPaths(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	events := make([]AgentEvent, 0, 4)
+	toolSet := DefaultToolSetForRole(RoleCoder, ToolEnv{
+		WorkingDir: root,
+		Role:       RoleCoder,
+		Emit: func(event AgentEvent) {
+			events = append(events, event)
+		},
+	})
+	tool, ok := toolSet.Get("write_file")
+	if !ok {
+		t.Fatal("expected write_file tool")
+	}
+
+	_, err := tool.Execute(context.Background(), map[string]any{
+		"path":    ".orchestra/plans/task_001.md",
+		"content": "# internal plan\n",
+	})
+	if err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+
+	for _, event := range events {
+		if event.Type == EventFileDiff {
+			t.Fatalf("expected no diff event for internal .orchestra path, got %+v", event)
+		}
 	}
 }
