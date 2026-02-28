@@ -15,4 +15,4 @@ release:
 clean:
 	rm -f orchestra
 	rm -rf dist/
-	rm -f orchestra_vss.db orchestra_vss.db-shm orchestra_vss.db-wal
+	rm -f orchestra.db orchestra_vec.db

@@ -8,16 +8,17 @@ import (
 )
 
 var (
+	connectModalBG       = lipgloss.Color("235")
 	connectModalBoxStyle = lipgloss.NewStyle().
 				Border(lipgloss.RoundedBorder()).
 				BorderForeground(lipgloss.Color("205")).
-				Background(lipgloss.Color("235")).
+				Background(connectModalBG).
 				Padding(1, 2)
-	connectTitleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("255")).Bold(true)
-	connectHintStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
-	connectSelStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("51")).Bold(true)
-	connectItemStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
-	connectOffStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	connectTitleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("255")).Background(connectModalBG).Bold(true)
+	connectHintStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Background(connectModalBG)
+	connectSelStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("51")).Background(connectModalBG).Bold(true)
+	connectItemStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Background(connectModalBG)
+	connectOffStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Background(connectModalBG)
 )
 
 type SelectOption struct {

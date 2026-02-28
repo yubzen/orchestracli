@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -140,5 +141,107 @@ func TestEmptyStateViewContainsOrchestraAndTip(t *testing.T) {
 	}
 	if strings.Contains(strings.ToLower(view), "ctrl+t variants") {
 		t.Fatalf("expected empty state to not show shortcuts hint, got %q", view)
+	}
+}
+
+func TestChatViewportStopsAutoScrollWhenUserScrollsUp(t *testing.T) {
+	m := NewChatModel()
+	m.SetSize(100, 20)
+	for i := 0; i < 60; i++ {
+		m.AddMessage("System", fmt.Sprintf("message %d", i))
+	}
+	if !m.viewport.AtBottom() {
+		t.Fatal("expected viewport to start at bottom")
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+	m = updated.(*ChatModel)
+	if m.viewport.AtBottom() {
+		t.Fatal("expected viewport to scroll up after pgup")
+	}
+	if m.stickToBottom {
+		t.Fatal("expected auto-scroll to be disabled after manual scroll")
+	}
+
+	m.AddMessage("System", "new message while scrolled up")
+	if m.viewport.AtBottom() {
+		t.Fatal("expected viewport to stay off-bottom when auto-scroll disabled")
+	}
+}
+
+func TestChatViewportResumesAutoScrollAtBottom(t *testing.T) {
+	m := NewChatModel()
+	m.SetSize(100, 20)
+	for i := 0; i < 60; i++ {
+		m.AddMessage("System", fmt.Sprintf("message %d", i))
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+	m = updated.(*ChatModel)
+	if m.stickToBottom {
+		t.Fatal("expected auto-scroll disabled after pgup")
+	}
+
+	for i := 0; i < 20 && !m.viewport.AtBottom(); i++ {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+		m = updated.(*ChatModel)
+	}
+	if !m.viewport.AtBottom() {
+		t.Fatal("expected viewport to reach bottom after pgdown")
+	}
+	if !m.stickToBottom {
+		t.Fatal("expected auto-scroll to re-enable at bottom")
+	}
+
+	m.AddMessage("System", "new message at bottom")
+	if !m.viewport.AtBottom() {
+		t.Fatal("expected viewport to remain pinned at bottom")
+	}
+}
+
+func TestChatModelRendersFileDiffBlockWithCap(t *testing.T) {
+	m := NewChatModel()
+	m.SetSize(120, 60)
+	m.AddMessage("System", "before diff")
+
+	newLines := make([]string, 0, 30)
+	for i := 0; i < 30; i++ {
+		newLines = append(newLines, fmt.Sprintf("new line %d", i))
+	}
+	m.AddFileDiff("hamid.ts", nil, newLines)
+
+	view := m.View()
+	if !strings.Contains(view, "Diff  hamid.ts") {
+		t.Fatalf("expected diff header in view, got %q", view)
+	}
+	if !strings.Contains(view, "+ new line 0") {
+		t.Fatalf("expected added diff lines, got %q", view)
+	}
+	if !strings.Contains(view, "… 10 more line(s)") {
+		t.Fatalf("expected capped diff indicator, got %q", view)
+	}
+}
+
+func TestChatModelActivityLineVisibleAndClearable(t *testing.T) {
+	m := NewChatModel()
+	m.SetSize(100, 20)
+	m.AddMessage("System", "hello")
+
+	m.SetActivity("Executing", "writeFile", "hamid.ts", "writing:hamid.ts")
+	view := m.View()
+	if !strings.Contains(view, "Executing writeFile") {
+		t.Fatalf("expected activity phase/action in view, got %q", view)
+	}
+	if !strings.Contains(view, "hamid.ts") {
+		t.Fatalf("expected activity target in view, got %q", view)
+	}
+	if !strings.Contains(view, "esc/ctrl+c to interrupt") {
+		t.Fatalf("expected interrupt hint in activity line, got %q", view)
+	}
+
+	m.ClearActivity()
+	view = m.View()
+	if strings.Contains(view, "Executing writeFile") {
+		t.Fatalf("expected cleared activity line, got %q", view)
 	}
 }

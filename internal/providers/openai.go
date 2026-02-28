@@ -9,8 +9,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-
-	"github.com/zalando/go-keyring"
 )
 
 type OpenAI struct {
@@ -40,9 +38,9 @@ func (p *OpenAI) Name() string {
 }
 
 func (p *OpenAI) getKey() (string, error) {
-	key, err := keyring.Get("orchestra", p.KeyName)
-	if err != nil || key == "" {
-		return "", &ProviderAuthError{ProviderName: p.KeyName, Msg: "API key not found in keyring"}
+	key, err := LoadCredential(p.KeyName)
+	if err != nil || strings.TrimSpace(key) == "" {
+		return "", &ProviderAuthError{ProviderName: p.KeyName, Msg: "API key not found. Run /connect to reconnect provider."}
 	}
 	return key, nil
 }
@@ -286,8 +284,8 @@ func decodeOpenAIFullResponse(body []byte, onToken TokenCallback) (CompletionRes
 					ID       string `json:"id"`
 					Type     string `json:"type"`
 					Function struct {
-						Name      string `json:"name"`
-						Arguments string `json:"arguments"`
+						Name      string          `json:"name"`
+						Arguments json.RawMessage `json:"arguments"`
 					} `json:"function"`
 				} `json:"tool_calls"`
 			} `json:"message"`
@@ -307,10 +305,24 @@ func decodeOpenAIFullResponse(body []byte, onToken TokenCallback) (CompletionRes
 	}
 
 	for _, tc := range choice.Message.ToolCalls {
+		arguments := tc.Function.Arguments
+		if len(arguments) == 0 {
+			arguments = json.RawMessage(`{}`)
+		}
+		// OpenAI-compatible providers are inconsistent here:
+		// - standard OpenAI: arguments is a JSON string
+		// - some compatibles: arguments is already a JSON object
+		// Normalize both to raw object JSON for downstream tool parsing.
+		if len(arguments) > 0 && arguments[0] == '"' {
+			var encoded string
+			if err := json.Unmarshal(arguments, &encoded); err == nil {
+				arguments = json.RawMessage(encoded)
+			}
+		}
 		resp.ToolCalls = append(resp.ToolCalls, ToolCall{
 			ID:        tc.ID,
 			Name:      tc.Function.Name,
-			Arguments: json.RawMessage(tc.Function.Arguments),
+			Arguments: arguments,
 		})
 	}
 

@@ -9,21 +9,23 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+var modelModalBG = lipgloss.Color("235")
+
 var (
 	modelModalBoxStyle = lipgloss.NewStyle().
 				Border(lipgloss.RoundedBorder()).
 				BorderForeground(lipgloss.Color("39")).
-				Background(lipgloss.Color("235")).
+				Background(modelModalBG).
 				Padding(1, 2)
-	modelModalTitleStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("51")).Bold(true)
-	modelModalHintStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
-	modelModalItemStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+	modelModalTitleStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("51")).Background(modelModalBG).Bold(true)
+	modelModalHintStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Background(modelModalBG)
+	modelModalItemStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Background(modelModalBG)
 	modelModalTabActiveStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("235")).Background(lipgloss.Color("45")).Bold(true).Padding(0, 1)
 	modelModalTabInactiveStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Background(lipgloss.Color("238")).Padding(0, 1)
-	modelModalSearchLabelStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("81")).Bold(true)
-	modelModalSearchValueStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("255"))
-	modelModalSearchHintStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
-	modelModalSearchCursor     = lipgloss.NewStyle().Foreground(lipgloss.Color("51"))
+	modelModalSearchLabelStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("81")).Background(modelModalBG).Bold(true)
+	modelModalSearchValueStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("255")).Background(modelModalBG)
+	modelModalSearchHintStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Background(modelModalBG)
+	modelModalSearchCursor     = lipgloss.NewStyle().Foreground(lipgloss.Color("51")).Background(modelModalBG)
 )
 
 type ModelOption struct {
@@ -65,12 +67,32 @@ type ModelsModal struct {
 func NewModelsModal(models []ModelOption) *ModelsModal {
 	delegate := list.NewDefaultDelegate()
 	delegate.SetSpacing(1)
-	delegate.Styles.NormalTitle = delegate.Styles.NormalTitle.Foreground(lipgloss.Color("252"))
-	delegate.Styles.NormalDesc = delegate.Styles.NormalDesc.Foreground(lipgloss.Color("244"))
-	delegate.Styles.SelectedTitle = delegate.Styles.SelectedTitle.Foreground(lipgloss.Color("213")).Bold(true)
-	delegate.Styles.SelectedDesc = delegate.Styles.SelectedDesc.Foreground(lipgloss.Color("183")).Bold(true)
+	delegate.Styles.NormalTitle = delegate.Styles.NormalTitle.Foreground(lipgloss.Color("252")).Background(modelModalBG)
+	delegate.Styles.NormalDesc = delegate.Styles.NormalDesc.Foreground(lipgloss.Color("244")).Background(modelModalBG)
+	delegate.Styles.SelectedTitle = delegate.Styles.SelectedTitle.Foreground(lipgloss.Color("213")).Background(modelModalBG).Bold(true)
+	delegate.Styles.SelectedDesc = delegate.Styles.SelectedDesc.Foreground(lipgloss.Color("183")).Background(modelModalBG).Bold(true)
+	delegate.Styles.DimmedTitle = delegate.Styles.DimmedTitle.Background(modelModalBG)
+	delegate.Styles.DimmedDesc = delegate.Styles.DimmedDesc.Background(modelModalBG)
+	delegate.Styles.FilterMatch = delegate.Styles.FilterMatch.Background(modelModalBG)
 
 	l := list.New(nil, delegate, 72, 14)
+	l.Styles.TitleBar = l.Styles.TitleBar.Background(modelModalBG)
+	l.Styles.Title = l.Styles.Title.Background(modelModalBG)
+	l.Styles.Spinner = l.Styles.Spinner.Background(modelModalBG)
+	l.Styles.FilterPrompt = l.Styles.FilterPrompt.Background(modelModalBG)
+	l.Styles.FilterCursor = l.Styles.FilterCursor.Background(modelModalBG)
+	l.Styles.DefaultFilterCharacterMatch = l.Styles.DefaultFilterCharacterMatch.Background(modelModalBG)
+	l.Styles.StatusBar = l.Styles.StatusBar.Background(modelModalBG)
+	l.Styles.StatusEmpty = l.Styles.StatusEmpty.Background(modelModalBG)
+	l.Styles.StatusBarActiveFilter = l.Styles.StatusBarActiveFilter.Background(modelModalBG)
+	l.Styles.StatusBarFilterCount = l.Styles.StatusBarFilterCount.Background(modelModalBG)
+	l.Styles.NoItems = l.Styles.NoItems.Background(modelModalBG)
+	l.Styles.PaginationStyle = l.Styles.PaginationStyle.Background(modelModalBG)
+	l.Styles.HelpStyle = l.Styles.HelpStyle.Background(modelModalBG)
+	l.Styles.ActivePaginationDot = l.Styles.ActivePaginationDot.Background(modelModalBG)
+	l.Styles.InactivePaginationDot = l.Styles.InactivePaginationDot.Background(modelModalBG)
+	l.Styles.ArabicPagination = l.Styles.ArabicPagination.Background(modelModalBG)
+	l.Styles.DividerDot = l.Styles.DividerDot.Background(modelModalBG)
 	l.SetShowTitle(false)
 	l.SetShowStatusBar(false)
 	l.SetShowHelp(false)

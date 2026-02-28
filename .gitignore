@@ -1,6 +1,7 @@
 # --- Binary & Executable Files ---
 /orchestra
 orchestra
+.orchestra/
 *.exe
 *.exe~
 *.dll
@@ -53,3 +54,4 @@ Thumbs.db
 *.test
 coverage.txt
 main
+

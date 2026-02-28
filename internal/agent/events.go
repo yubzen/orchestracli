@@ -12,9 +12,16 @@ const (
 	EventRunning
 	EventReviewing
 	EventWaiting
+	EventFileDiff
 	EventDone
 	EventError
 )
+
+type FileDiffPayload struct {
+	Path     string
+	OldLines []string
+	NewLines []string
+}
 
 type AgentEvent struct {
 	Type    AgentEventType
